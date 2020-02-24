@@ -3480,6 +3480,12 @@ module.exports.User = User;
 
 },{"./cookie":19,"./entity":20,"./store":28,"bind-all":69,"component-cookie":72,"debug":85,"inherits":92,"uuid":133}],30:[function(require,module,exports){
 module.exports={
+  "_args": [
+    [
+      "@segment/analytics.js-core@3.10.1",
+      "/Users/wjensen/repos/analytics.js"
+    ]
+  ],
   "_from": "@segment/analytics.js-core@3.10.1",
   "_id": "@segment/analytics.js-core@3.10.1",
   "_inBundle": false,
@@ -3501,8 +3507,7 @@ module.exports={
     "/"
   ],
   "_resolved": "https://registry.npmjs.org/@segment/analytics.js-core/-/analytics.js-core-3.10.1.tgz",
-  "_shasum": "faf983dbddb5917de3ff500843c04a2cc4236ab7",
-  "_spec": "@segment/analytics.js-core@3.10.1",
+  "_spec": "3.10.1",
   "_where": "/Users/wjensen/repos/analytics.js",
   "author": {
     "name": "Segment",
@@ -3511,7 +3516,6 @@ module.exports={
   "bugs": {
     "url": "https://github.com/segmentio/analytics.js-core/issues"
   },
-  "bundleDependencies": false,
   "commitlint": {
     "extends": [
       "@commitlint/config-conventional"
@@ -3559,7 +3563,6 @@ module.exports={
     "spark-md5": "^2.0.2",
     "uuid": "^2.0.2"
   },
-  "deprecated": false,
   "description": "The hassle-free way to integrate analytics into any web application.",
   "devDependencies": {
     "@commitlint/cli": "^7.0.0",
