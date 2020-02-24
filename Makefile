@@ -18,7 +18,7 @@ SRC = $(wildcard lib/*.js)
 
 # Install node modules.
 node_modules: package.json $(wildcard node_modules/*/package.json)
-	@npm  install
+	@npm install
 	@touch node_modules
 
 # Install dependencies.
