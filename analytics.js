@@ -35,7 +35,7 @@ Object.keys(Integrations).forEach(function(name) {
   analytics.use(Integrations[name]);
 });
 
-},{"../package.json":120,"./integrations":2,"@segment/analytics.js-core":22}],2:[function(require,module,exports){
+},{"../package.json":136,"./integrations":2,"@segment/analytics.js-core":22}],2:[function(require,module,exports){
 /* eslint quote-props: off */
 'use strict';
 
@@ -45,10 +45,12 @@ Object.keys(Integrations).forEach(function(name) {
  Make sure the integrations added are also installed and saved in the package.json
  */
 module.exports = {
+  'google-analytics': require('@segment/analytics.js-integration-google-analytics'),
+  'google-tag-manager': require('@segment/analytics.js-integration-google-tag-manager'),
   'segmentio': require('@segment/analytics.js-integration-segmentio')
 };
 
-},{"@segment/analytics.js-integration-segmentio":30}],3:[function(require,module,exports){
+},{"@segment/analytics.js-integration-google-analytics":31,"@segment/analytics.js-integration-google-tag-manager":32,"@segment/analytics.js-integration-segmentio":33}],3:[function(require,module,exports){
 'use strict';
 
 /*
@@ -340,7 +342,7 @@ var clone = function clone(obj) {
 
 module.exports = clone;
 
-},{"component-type":73}],6:[function(require,module,exports){
+},{"component-type":83}],6:[function(require,module,exports){
 'use strict';
 
 /*
@@ -1276,7 +1278,7 @@ function ads(query) {
 
 module.exports = ads;
 
-},{"component-querystring":71}],18:[function(require,module,exports){
+},{"component-querystring":81}],18:[function(require,module,exports){
 (function (global){
 'use strict';
 
@@ -1288,11 +1290,14 @@ var _analytics = global.analytics;
 
 var Alias = require('segmentio-facade').Alias;
 var Emitter = require('component-emitter');
+var Facade = require('segmentio-facade');
 var Group = require('segmentio-facade').Group;
 var Identify = require('segmentio-facade').Identify;
+var SourceMiddlewareChain = require('./middleware').SourceMiddlewareChain;
+var IntegrationMiddlewareChain = require('./middleware')
+  .IntegrationMiddlewareChain;
 var Page = require('segmentio-facade').Page;
 var Track = require('segmentio-facade').Track;
-var after = require('@ndhoule/after');
 var bindAll = require('bind-all');
 var clone = require('@ndhoule/clone');
 var extend = require('extend');
@@ -1325,6 +1330,8 @@ var type = require('component-type');
 function Analytics() {
   this._options({});
   this.Integrations = {};
+  this._sourceMiddlewares = new SourceMiddlewareChain();
+  this._integrationMiddlewares = new IntegrationMiddlewareChain();
   this._integrations = {};
   this._readied = false;
   this._timeout = 300;
@@ -1369,6 +1376,40 @@ Analytics.prototype.addIntegration = function(Integration) {
   var name = Integration.prototype.name;
   if (!name) throw new TypeError('attempted to add an invalid integration');
   this.Integrations[name] = Integration;
+  return this;
+};
+
+/**
+ * Define a new `SourceMiddleware`
+ *
+ * @param {Function} Middleware
+ * @return {Analytics}
+ */
+
+Analytics.prototype.addSourceMiddleware = function(middleware) {
+  if (this.initialized)
+    throw new Error(
+      'attempted to add a source middleware after initialization'
+    );
+
+  this._sourceMiddlewares.add(middleware);
+  return this;
+};
+
+/**
+ * Define a new `IntegrationMiddleware`
+ *
+ * @param {Function} Middleware
+ * @return {Analytics}
+ */
+
+Analytics.prototype.addIntegrationMiddleware = function(middleware) {
+  if (this.initialized)
+    throw new Error(
+      'attempted to add an integration middleware after initialization'
+    );
+
+  this._integrationMiddlewares.add(middleware);
   return this;
 };
 
@@ -1426,11 +1467,15 @@ Analytics.prototype.init = Analytics.prototype.initialize = function(
   group.load();
 
   // make ready callback
+  var readyCallCount = 0;
   var integrationCount = keys(integrations).length;
-  var ready = after(integrationCount, function() {
-    self._readied = true;
-    self.emit('ready');
-  });
+  var ready = function() {
+    readyCallCount++;
+    if (readyCallCount >= integrationCount) {
+      self._readied = true;
+      self.emit('ready');
+    }
+  };
 
   // init if no integrations
   if (integrationCount <= 0) {
@@ -1440,15 +1485,25 @@ Analytics.prototype.init = Analytics.prototype.initialize = function(
   // initialize integrations, passing ready
   // create a list of any integrations that did not initialize - this will be passed with all events for replay support:
   this.failedInitializations = [];
+  var initialPageSkipped = false;
   each(function(integration) {
     if (
       options.initialPageview &&
       integration.options.initialPageview === false
     ) {
-      integration.page = after(2, integration.page);
+      // We've assumed one initial pageview, so make sure we don't count the first page call.
+      var page = integration.page;
+      integration.page = function() {
+        if (initialPageSkipped) {
+          return page.apply(this, arguments);
+        }
+        initialPageSkipped = true;
+        return;
+      };
     }
 
     integration.analytics = self;
+
     integration.once('ready', ready);
     try {
       metrics.increment('analytics_js.integration.invoke', {
@@ -1465,12 +1520,12 @@ Analytics.prototype.init = Analytics.prototype.initialize = function(
       self.failedInitializations.push(integrationName);
       self.log('Error initializing %s integration: %o', integrationName, e);
       // Mark integration as ready to prevent blocking of anyone listening to analytics.ready()
+
       integration.ready();
     }
   }, integrations);
 
-  // backwards compat with angular plugin.
-  // TODO: remove
+  // backwards compat with angular plugin and used for init logic checks
   this.initialized = true;
 
   this.emit('initialize', settings, options);
@@ -1951,45 +2006,106 @@ Analytics.prototype._callback = function(fn) {
 
 Analytics.prototype._invoke = function(method, facade) {
   var self = this;
-  metrics.increment('analytics_js.invoke', {
-    method: method
-  });
-  this.emit('invoke', facade);
 
-  var failedInitializations = self.failedInitializations || [];
-  each(function(integration, name) {
-    if (!facade.enabled(name)) return;
-    // Check if an integration failed to initialize.
-    // If so, do not process the message as the integration is in an unstable state.
-    if (failedInitializations.indexOf(name) >= 0) {
-      self.log(
-        'Skipping invokation of .%s method of %s integration. Integation failed to initialize properly.',
-        method,
-        name
-      );
-    } else {
-      try {
-        metrics.increment('analytics_js.integration.invoke', {
-          method: method,
-          integration_name: integration.name
+  try {
+    this._sourceMiddlewares.applyMiddlewares(
+      extend(true, new Facade({}), facade),
+      this._integrations,
+      function(result) {
+        // A nullified payload should not be sent.
+        if (result === null) {
+          self.log(
+            'Payload with method "%s" was null and dropped by source a middleware.',
+            method
+          );
+          return;
+        }
+
+        // Check if the payload is still a Facade. If not, convert it to one.
+        if (!(result instanceof Facade)) {
+          result = new Facade(result);
+        }
+
+        self.emit('invoke', result);
+        metrics.increment('analytics_js.invoke', {
+          method: method
         });
-        integration.invoke.call(integration, method, facade);
-      } catch (e) {
-        metrics.increment('analytics_js.integration.invoke.error', {
-          method: method,
-          integration_name: integration.name
-        });
-        self.log(
-          'Error invoking .%s method of %s integration: %o',
-          method,
-          name,
-          e
-        );
+
+        applyIntegrationMiddlewares(result);
       }
-    }
-  }, this._integrations);
+    );
+  } catch (e) {
+    metrics.increment('analytics_js.invoke.error', {
+      method: method
+    });
+    self.log(
+      'Error invoking .%s method of %s integration: %o',
+      method,
+      name,
+      e
+    );
+  }
 
   return this;
+
+  function applyIntegrationMiddlewares(facade) {
+    var failedInitializations = self.failedInitializations || [];
+    each(function(integration, name) {
+      var facadeCopy = extend(true, new Facade({}), facade);
+
+      if (!facadeCopy.enabled(name)) return;
+      // Check if an integration failed to initialize.
+      // If so, do not process the message as the integration is in an unstable state.
+      if (failedInitializations.indexOf(name) >= 0) {
+        self.log(
+          'Skipping invocation of .%s method of %s integration. Integration failed to initialize properly.',
+          method,
+          name
+        );
+      } else {
+        try {
+          // Apply any integration middlewares that exist, then invoke the integration with the result.
+          self._integrationMiddlewares.applyMiddlewares(
+            facadeCopy,
+            integration.name,
+            function(result) {
+              // A nullified payload should not be sent to an integration.
+              if (result === null) {
+                self.log(
+                  'Payload to integration "%s" was null and dropped by a middleware.',
+                  name
+                );
+                return;
+              }
+
+              // Check if the payload is still a Facade. If not, convert it to one.
+              if (!(result instanceof Facade)) {
+                result = new Facade(result);
+              }
+
+              metrics.increment('analytics_js.integration.invoke', {
+                method: method,
+                integration_name: integration.name
+              });
+
+              integration.invoke.call(integration, method, result);
+            }
+          );
+        } catch (e) {
+          metrics.increment('analytics_js.integration.invoke.error', {
+            method: method,
+            integration_name: integration.name
+          });
+          self.log(
+            'Error invoking .%s method of %s integration: %o',
+            method,
+            name,
+            e
+          );
+        }
+      }
+    }, self._integrations);
+  }
 };
 
 /**
@@ -2137,7 +2253,7 @@ module.exports.store = store;
 module.exports.metrics = metrics;
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./cookie":19,"./group":21,"./memory":23,"./metrics":24,"./normalize":25,"./pageDefaults":26,"./store":27,"./user":28,"@ndhoule/after":3,"@ndhoule/clone":5,"@ndhoule/defaults":6,"@ndhoule/each":8,"@ndhoule/foldl":11,"@ndhoule/keys":13,"@ndhoule/pick":15,"@segment/is-meta":40,"@segment/prevent-default":53,"bind-all":59,"component-emitter":68,"component-event":69,"component-querystring":71,"component-type":73,"debug":75,"extend":77,"is":81,"next-tick":92,"segmentio-facade":102}],19:[function(require,module,exports){
+},{"./cookie":19,"./group":21,"./memory":23,"./metrics":24,"./middleware":25,"./normalize":26,"./pageDefaults":27,"./store":28,"./user":29,"@ndhoule/clone":5,"@ndhoule/defaults":6,"@ndhoule/each":8,"@ndhoule/foldl":11,"@ndhoule/keys":13,"@ndhoule/pick":15,"@segment/is-meta":49,"@segment/prevent-default":62,"bind-all":69,"component-emitter":78,"component-event":79,"component-querystring":81,"component-type":83,"debug":85,"extend":87,"is":94,"next-tick":105,"segmentio-facade":117}],19:[function(require,module,exports){
 'use strict';
 
 /**
@@ -2265,7 +2381,7 @@ module.exports = bindAll(new Cookie());
 
 module.exports.Cookie = Cookie;
 
-},{"@ndhoule/clone":5,"@ndhoule/defaults":6,"@segment/top-domain":57,"bind-all":59,"component-cookie":62,"debug":75,"json3":82}],20:[function(require,module,exports){
+},{"@ndhoule/clone":5,"@ndhoule/defaults":6,"@segment/top-domain":66,"bind-all":69,"component-cookie":72,"debug":85,"json3":95}],20:[function(require,module,exports){
 'use strict';
 
 /*
@@ -2374,10 +2490,48 @@ Entity.prototype.id = function(id) {
  */
 
 Entity.prototype._getId = function() {
-  var ret = this._options.persist
-    ? this.storage().get(this._options.cookie.key)
-    : this._id;
-  return ret === undefined ? null : ret;
+  if (!this._options.persist) {
+    return this._id === undefined ? null : this._id;
+  }
+
+  // Check cookies.
+  var cookieId = this._getIdFromCookie();
+  if (cookieId) {
+    return cookieId;
+  }
+
+  // Check localStorage.
+  var lsId = this._getIdFromLocalStorage();
+  if (lsId) {
+    // Copy the id to cookies so we can read it directly from cookies next time.
+    this._setIdInCookies(lsId);
+    return lsId;
+  }
+
+  return null;
+};
+
+/**
+ * Get the entity's id from cookies.
+ *
+ * @return {String}
+ */
+
+Entity.prototype._getIdFromCookie = function() {
+  return this.storage().get(this._options.cookie.key);
+};
+
+/**
+ * Get the entity's id from cookies.
+ *
+ * @return {String}
+ */
+
+Entity.prototype._getIdFromLocalStorage = function() {
+  if (!this._options.localStorageFallbackDisabled) {
+    return store.get(this._options.cookie.key);
+  }
+  return null;
 };
 
 /**
@@ -2388,9 +2542,32 @@ Entity.prototype._getId = function() {
 
 Entity.prototype._setId = function(id) {
   if (this._options.persist) {
-    this.storage().set(this._options.cookie.key, id);
+    this._setIdInCookies(id);
+    this._setIdInLocalStorage(id);
   } else {
     this._id = id;
+  }
+};
+
+/**
+ * Set the entity's `id` in cookies.
+ *
+ * @param {String} id
+ */
+
+Entity.prototype._setIdInCookies = function(id) {
+  this.storage().set(this._options.cookie.key, id);
+};
+
+/**
+ * Set the entity's `id` in local storage.
+ *
+ * @param {String} id
+ */
+
+Entity.prototype._setIdInLocalStorage = function(id) {
+  if (!this._options.localStorageFallbackDisabled) {
+    store.set(this._options.cookie.key, id);
   }
 };
 
@@ -2469,8 +2646,8 @@ Entity.prototype.identify = function(id, traits) {
 
 Entity.prototype.save = function() {
   if (!this._options.persist) return false;
-  cookie.set(this._options.cookie.key, this.id());
-  store.set(this._options.localStorage.key, this.traits());
+  this._setId(this.id());
+  this._setTraits(this.traits());
   return true;
 };
 
@@ -2481,7 +2658,8 @@ Entity.prototype.save = function() {
 Entity.prototype.logout = function() {
   this.id(null);
   this.traits({});
-  cookie.remove(this._options.cookie.key);
+  this.storage().remove(this._options.cookie.key);
+  store.remove(this._options.cookie.key);
   store.remove(this._options.localStorage.key);
 };
 
@@ -2499,11 +2677,11 @@ Entity.prototype.reset = function() {
  */
 
 Entity.prototype.load = function() {
-  this.id(cookie.get(this._options.cookie.key));
-  this.traits(store.get(this._options.localStorage.key));
+  this.id(this.id());
+  this.traits(this.traits());
 };
 
-},{"./cookie":19,"./memory":23,"./store":27,"@ndhoule/clone":5,"@ndhoule/defaults":6,"@ndhoule/extend":10,"@segment/isodate-traverse":41,"debug":75}],21:[function(require,module,exports){
+},{"./cookie":19,"./memory":23,"./store":28,"@ndhoule/clone":5,"@ndhoule/defaults":6,"@ndhoule/extend":10,"@segment/isodate-traverse":50,"debug":85}],21:[function(require,module,exports){
 'use strict';
 
 /*
@@ -2559,7 +2737,7 @@ module.exports = bindAll(new Group());
 
 module.exports.Group = Group;
 
-},{"./entity":20,"bind-all":59,"debug":75,"inherits":79}],22:[function(require,module,exports){
+},{"./entity":20,"bind-all":69,"debug":85,"inherits":92}],22:[function(require,module,exports){
 'use strict';
 
 /**
@@ -2586,7 +2764,7 @@ analytics.VERSION = require('../package.json').version;
 
 module.exports = analytics;
 
-},{"../package.json":29,"./analytics":18}],23:[function(require,module,exports){
+},{"../package.json":30,"./analytics":18}],23:[function(require,module,exports){
 'use strict';
 
 /*
@@ -2652,7 +2830,7 @@ Memory.prototype.remove = function(key) {
   return true;
 };
 
-},{"@ndhoule/clone":5,"bind-all":59}],24:[function(require,module,exports){
+},{"@ndhoule/clone":5,"bind-all":69}],24:[function(require,module,exports){
 'use strict';
 
 var bindAll = require('bind-all');
@@ -2749,7 +2927,105 @@ module.exports = bindAll(new Metrics());
 
 module.exports.Metrics = Metrics;
 
-},{"@segment/send-json":55,"bind-all":59,"debug":75}],25:[function(require,module,exports){
+},{"@segment/send-json":64,"bind-all":69,"debug":85}],25:[function(require,module,exports){
+'use strict';
+
+var Facade = require('segmentio-facade');
+
+module.exports.SourceMiddlewareChain = function SourceMiddlewareChain() {
+  var apply = middlewareChain(this);
+
+  this.applyMiddlewares = function(facade, integrations, callback) {
+    return apply(
+      function(mw, payload, next) {
+        mw({
+          integrations: integrations,
+          next: next,
+          payload: payload
+        });
+      },
+      facade,
+      callback
+    );
+  };
+};
+
+module.exports.IntegrationMiddlewareChain = function IntegrationMiddlewareChain() {
+  var apply = middlewareChain(this);
+
+  this.applyMiddlewares = function(facade, integration, callback) {
+    return apply(
+      function(mw, payload, next) {
+        mw(payload, integration, next);
+      },
+      facade,
+      callback
+    );
+  };
+};
+
+// Chain is essentially a linked list of middlewares to run in order.
+function middlewareChain(dest) {
+  var middlewares = [];
+
+  // Return a copy to prevent external mutations.
+  dest.getMiddlewares = function() {
+    return middlewares.slice();
+  };
+
+  dest.add = function(middleware) {
+    if (typeof middleware !== 'function')
+      throw new Error('attempted to add non-function middleware');
+
+    // Check for identical object references - bug check.
+    if (middlewares.indexOf(middleware) !== -1)
+      throw new Error('middleware is already registered');
+    middlewares.push(middleware);
+  };
+
+  // fn is the callback to be run once all middlewares have been applied.
+  return function applyMiddlewares(run, facade, callback) {
+    if (typeof facade !== 'object')
+      throw new Error('applyMiddlewares requires a payload object');
+    if (typeof callback !== 'function')
+      throw new Error('applyMiddlewares requires a function callback');
+
+    // Attach callback to the end of the chain.
+    var middlewaresToApply = middlewares.slice();
+    middlewaresToApply.push(callback);
+    executeChain(run, facade, middlewaresToApply, 0);
+  };
+}
+
+// Go over all middlewares until all have been applied.
+function executeChain(run, payload, middlewares, index) {
+  // If the facade has been nullified, immediately skip to the final middleware.
+  if (payload === null) {
+    middlewares[middlewares.length - 1](null);
+    return;
+  }
+
+  // Check if the payload is still a Facade. If not, convert it to one.
+  if (!(payload instanceof Facade)) {
+    payload = new Facade(payload);
+  }
+
+  var mw = middlewares[index];
+  if (mw) {
+    // If there's another middleware, continue down the chain. Otherwise, call the final function.
+    if (middlewares[index + 1]) {
+      run(mw, payload, function(result) {
+        executeChain(run, result, middlewares, ++index);
+      });
+    } else {
+      mw(payload);
+    }
+  }
+}
+
+module.exports.middlewareChain = middlewareChain;
+
+},{"segmentio-facade":117}],26:[function(require,module,exports){
 'use strict';
 
 /**
@@ -2762,6 +3038,9 @@ var each = require('@ndhoule/each');
 var includes = require('@ndhoule/includes');
 var map = require('@ndhoule/map');
 var type = require('component-type');
+var uuid = require('uuid').v4;
+var json = require('json3');
+var md5 = require('spark-md5').hash;
 
 /**
  * HOP.
@@ -2827,6 +3106,9 @@ function normalize(msg, list) {
     }
   }, opts);
 
+  // generate and attach a messageId to msg
+  msg.messageId = 'ajs-' + md5(json.stringify(msg) + uuid());
+
   // cleanup
   delete msg.options;
   ret.integrations = integrations;
@@ -2844,7 +3126,7 @@ function normalize(msg, list) {
   }
 }
 
-},{"@ndhoule/defaults":6,"@ndhoule/each":8,"@ndhoule/includes":12,"@ndhoule/map":14,"component-type":73,"debug":75}],26:[function(require,module,exports){
+},{"@ndhoule/defaults":6,"@ndhoule/each":8,"@ndhoule/includes":12,"@ndhoule/map":14,"component-type":83,"debug":85,"json3":95,"spark-md5":124,"uuid":133}],27:[function(require,module,exports){
 'use strict';
 
 /*
@@ -2908,7 +3190,7 @@ function canonicalUrl(search) {
 
 module.exports = pageDefaults;
 
-},{"@ndhoule/includes":12,"@segment/canonical":38,"component-url":74}],27:[function(require,module,exports){
+},{"@ndhoule/includes":12,"@segment/canonical":47,"component-url":84}],28:[function(require,module,exports){
 'use strict';
 
 /*
@@ -2993,7 +3275,7 @@ module.exports = bindAll(new Store());
 
 module.exports.Store = Store;
 
-},{"@ndhoule/defaults":6,"@segment/store":56,"bind-all":59}],28:[function(require,module,exports){
+},{"@ndhoule/defaults":6,"@segment/store":65,"bind-all":69}],29:[function(require,module,exports){
 'use strict';
 
 /*
@@ -3007,6 +3289,7 @@ var debug = require('debug')('analytics:user');
 var inherit = require('inherits');
 var rawCookie = require('component-cookie');
 var uuid = require('uuid');
+var localStorage = require('./store');
 
 /**
  * User defaults
@@ -3095,13 +3378,28 @@ User.prototype.anonymousId = function(anonymousId) {
   // set / remove
   if (arguments.length) {
     store.set('ajs_anonymous_id', anonymousId);
+    this._setAnonymousIdInLocalStorage(anonymousId);
     return this;
   }
 
   // new
   anonymousId = store.get('ajs_anonymous_id');
   if (anonymousId) {
+    // value exists in cookie, copy it to localStorage
+    this._setAnonymousIdInLocalStorage(anonymousId);
+    // refresh cookie to extend expiry
+    store.set('ajs_anonymous_id', anonymousId);
     return anonymousId;
+  }
+
+  if (!this._options.localStorageFallbackDisabled) {
+    // if anonymousId doesn't exist in cookies, check localStorage
+    anonymousId = localStorage.get('ajs_anonymous_id');
+    if (anonymousId) {
+      // Write to cookies if available in localStorage but not cookies
+      store.set('ajs_anonymous_id', anonymousId);
+      return anonymousId;
+    }
   }
 
   // old - it is not stringified so we use the raw cookie.
@@ -3109,6 +3407,7 @@ User.prototype.anonymousId = function(anonymousId) {
   if (anonymousId) {
     anonymousId = anonymousId.split('----')[0];
     store.set('ajs_anonymous_id', anonymousId);
+    this._setAnonymousIdInLocalStorage(anonymousId);
     store.remove('_sio');
     return anonymousId;
   }
@@ -3116,7 +3415,20 @@ User.prototype.anonymousId = function(anonymousId) {
   // empty
   anonymousId = uuid.v4();
   store.set('ajs_anonymous_id', anonymousId);
+  this._setAnonymousIdInLocalStorage(anonymousId);
   return store.get('ajs_anonymous_id');
+};
+
+/**
+ * Set the user's `anonymousid` in local storage.
+ *
+ * @param {String} id
+ */
+
+User.prototype._setAnonymousIdInLocalStorage = function(id) {
+  if (!this._options.localStorageFallbackDisabled) {
+    localStorage.set('ajs_anonymous_id', id);
+  }
 };
 
 /**
@@ -3166,32 +3478,37 @@ module.exports = bindAll(new User());
 
 module.exports.User = User;
 
-},{"./cookie":19,"./entity":20,"bind-all":59,"component-cookie":62,"debug":75,"inherits":79,"uuid":117}],29:[function(require,module,exports){
+},{"./cookie":19,"./entity":20,"./store":28,"bind-all":69,"component-cookie":72,"debug":85,"inherits":92,"uuid":133}],30:[function(require,module,exports){
 module.exports={
-  "_from": "@segment/analytics.js-core@^3.0.0",
-  "_id": "@segment/analytics.js-core@3.7.2",
+  "_args": [
+    [
+      "@segment/analytics.js-core@3.10.1",
+      "/Users/wjensen/repos/analytics.js"
+    ]
+  ],
+  "_from": "@segment/analytics.js-core@3.10.1",
+  "_id": "@segment/analytics.js-core@3.10.1",
   "_inBundle": false,
-  "_integrity": "sha512-+I0jGiZka4oZVZCXCYmTdG0h0kebcqXLVWTgDp/ZiXGwUeVjT6yfk2H69j7NbAJDMUg09db0nEMbZcyjltX/Zw==",
+  "_integrity": "sha512-YfI4Zu1YQpQ+HZ0cVvnkEeFaKLJrVkQTN0P9yDPTgfHiK5aPIPyiTPvYNb17cLZX4j2PW+rvpDCi9RjVpFws0A==",
   "_location": "/@segment/analytics.js-core",
   "_phantomChildren": {},
   "_requested": {
-    "type": "range",
+    "type": "version",
     "registry": true,
-    "raw": "@segment/analytics.js-core@^3.0.0",
+    "raw": "@segment/analytics.js-core@3.10.1",
     "name": "@segment/analytics.js-core",
     "escapedName": "@segment%2fanalytics.js-core",
     "scope": "@segment",
-    "rawSpec": "^3.0.0",
+    "rawSpec": "3.10.1",
     "saveSpec": null,
-    "fetchSpec": "^3.0.0"
+    "fetchSpec": "3.10.1"
   },
   "_requiredBy": [
     "/"
   ],
-  "_resolved": "https://registry.npmjs.org/@segment/analytics.js-core/-/analytics.js-core-3.7.2.tgz",
-  "_shasum": "4e663b49ec5c9cb6baf40394ba798a6d84075a1f",
-  "_spec": "@segment/analytics.js-core@^3.0.0",
-  "_where": "/Users/georgefraser/Documents/analytics.js",
+  "_resolved": "https://registry.npmjs.org/@segment/analytics.js-core/-/analytics.js-core-3.10.1.tgz",
+  "_spec": "3.10.1",
+  "_where": "/Users/wjensen/repos/analytics.js",
   "author": {
     "name": "Segment",
     "email": "friends@segment.com"
@@ -3199,9 +3516,17 @@ module.exports={
   "bugs": {
     "url": "https://github.com/segmentio/analytics.js-core/issues"
   },
-  "bundleDependencies": false,
+  "commitlint": {
+    "extends": [
+      "@commitlint/config-conventional"
+    ]
+  },
+  "config": {
+    "commitizen": {
+      "path": "cz-conventional-changelog"
+    }
+  },
   "dependencies": {
-    "@ndhoule/after": "^1.0.0",
     "@ndhoule/clone": "^1.0.0",
     "@ndhoule/defaults": "^2.0.1",
     "@ndhoule/each": "^2.0.1",
@@ -3227,7 +3552,7 @@ module.exports={
     "component-type": "^1.2.1",
     "component-url": "^0.2.1",
     "debug": "^0.7.4",
-    "extend": "3.0.1",
+    "extend": "3.0.2",
     "inherits": "^2.0.1",
     "install": "^0.7.3",
     "is": "^3.1.0",
@@ -3235,18 +3560,23 @@ module.exports={
     "new-date": "^1.0.0",
     "next-tick": "^0.2.2",
     "segmentio-facade": "^3.0.2",
+    "spark-md5": "^2.0.2",
     "uuid": "^2.0.2"
   },
-  "deprecated": false,
   "description": "The hassle-free way to integrate analytics into any web application.",
   "devDependencies": {
+    "@commitlint/cli": "^7.0.0",
+    "@commitlint/config-conventional": "^7.0.1",
     "@segment/analytics.js-integration": "^3.2.1",
     "@segment/eslint-config": "^4.0.0",
     "browserify": "13.0.0",
     "browserify-istanbul": "^2.0.0",
     "codecov": "^3.0.2",
+    "commitizen": "^2.10.1",
+    "commitlint-circle": "^1.0.0",
     "compat-trigger-event": "^1.0.0",
     "component-each": "^0.2.6",
+    "cz-conventional-changelog": "^2.1.0",
     "eslint": "^4.19.1",
     "eslint-config-prettier": "^2.9.0",
     "eslint-plugin-mocha": "^5.0.0",
@@ -3298,16 +3628,1314 @@ module.exports={
     "url": "git+https://github.com/segmentio/analytics.js-core.git"
   },
   "scripts": {
+    "commitmsg": "commitlint -E GIT_PARAMS",
+    "cz": "git-cz",
     "format": "prettier-eslint --write --list-different \"./{lib,test}/**/*.{js,json,md}\"",
     "lint": "eslint \"./{lib,test}/**/*.js\"",
     "np": "np --no-publish",
     "precommit": "lint-staged",
     "test": "make test"
   },
-  "version": "3.7.2"
+  "version": "3.10.1"
 }
 
-},{}],30:[function(require,module,exports){
+},{}],31:[function(require,module,exports){
+'use strict';
+
+/**
+ * Module dependencies.
+ */
+
+var Track = require('segmentio-facade').Track;
+var defaults = require('@ndhoule/defaults');
+var dot = require('obj-case');
+var each = require('component-each');
+var integration = require('@segment/analytics.js-integration');
+var is = require('is');
+var len = require('object-component').length;
+var push = require('global-queue')('_gaq');
+var reject = require('reject');
+var useHttps = require('use-https');
+var extend = require('extend');
+var user;
+
+/**
+ * Expose plugin.
+ */
+
+module.exports = exports = function(analytics) {
+  // eslint-disable-next-line no-use-before-define
+  analytics.addIntegration(GA);
+  user = analytics.user();
+};
+
+/**
+ * Expose `GA` integration.
+ *
+ * http://support.google.com/analytics/bin/answer.py?hl=en&answer=2558867
+ * https://developers.google.com/analytics/devguides/collection/gajs/methods/gaJSApiBasicConfiguration#_gat.GA_Tracker_._setSiteSpeedSampleRate
+ */
+
+var GA = (exports.Integration = integration('Google Analytics')
+  .readyOnLoad()
+  .global('ga')
+  .global('gaplugins')
+  .global('_gaq')
+  .global('GoogleAnalyticsObject')
+  .option('anonymizeIp', false)
+  .option('useGoogleAmpClientId', false)
+  .option('classic', false)
+  .option('contentGroupings', {})
+  .option('dimensions', {})
+  .option('domain', 'auto')
+  .option('doubleClick', false)
+  .option('enhancedEcommerce', false)
+  .option('enhancedLinkAttribution', false)
+  .option('ignoredReferrers', null)
+  .option('includeSearch', false)
+  .option('setAllMappedProps', true)
+  .option('metrics', {})
+  .option('nonInteraction', false)
+  .option('sendUserId', false)
+  .option('siteSpeedSampleRate', 1)
+  .option('sampleRate', 100)
+  .option('trackCategorizedPages', true)
+  .option('trackNamedPages', true)
+  .option('trackingId', '')
+  .option('optimize', '')
+  .option('nameTracker', false)
+  .option('resetCustomDimensionsOnPage', [])
+  .tag('library', '<script src="//www.google-analytics.com/analytics.js">')
+  .tag('double click', '<script src="//stats.g.doubleclick.net/dc.js">')
+  .tag('http', '<script src="http://www.google-analytics.com/ga.js">')
+  .tag('https', '<script src="https://ssl.google-analytics.com/ga.js">'));
+
+/**
+ * On `construct` swap any config-based methods to the proper implementation.
+ */
+
+GA.on('construct', function(integration) {
+  /* eslint-disable */
+  if (integration.options.classic) {
+    integration.initialize = integration.initializeClassic;
+    integration.loaded = integration.loadedClassic;
+    integration.page = integration.pageClassic;
+    integration.track = integration.trackClassic;
+    integration.orderCompleted = integration.completedOrderClassic;
+  } else if (integration.options.enhancedEcommerce) {
+    integration.productViewed = integration.productViewedEnhanced;
+    integration.productClicked = integration.productClickedEnhanced;
+    integration.productAdded = integration.productAddedEnhanced;
+    integration.productRemoved = integration.productRemovedEnhanced;
+    integration.checkoutStarted = integration.checkoutStartedEnhanced;
+    integration.checkoutStepViewed = integration.checkoutStepViewedEnhanced;
+    integration.checkoutStepCompleted =
+      integration.checkoutStepCompletedEnhanced;
+    integration.orderUpdated = integration.orderUpdatedEnhanced;
+    integration.orderCompleted = integration.orderCompletedEnhanced;
+    integration.orderRefunded = integration.orderRefundedEnhanced;
+    integration.promotionViewed = integration.promotionViewedEnhanced;
+    integration.promotionClicked = integration.promotionClickedEnhanced;
+    integration.productListViewed = integration.productListViewedEnhanced;
+    integration.productListFiltered = integration.productListFilteredEnhanced;
+  }
+  /* eslint-enable */
+});
+
+/**
+ * Initialize.
+ *
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/advanced
+ */
+
+GA.prototype.initialize = function() {
+  this.pageCalled = false;
+  var opts = this.options;
+
+  // setup the tracker globals
+  window.GoogleAnalyticsObject = 'ga';
+  window.ga =
+    window.ga ||
+    function() {
+      window.ga.q = window.ga.q || [];
+      window.ga.q.push(arguments);
+    };
+  window.ga.l = new Date().getTime();
+
+  if (window.location.hostname === 'localhost') opts.domain = 'none';
+  var config = {
+    // Fall back on default to protect against empty string
+    cookieDomain: opts.domain || GA.prototype.defaults.domain,
+    siteSpeedSampleRate: opts.siteSpeedSampleRate,
+    sampleRate: opts.sampleRate,
+    allowLinker: true,
+    useAmpClientId: opts.useGoogleAmpClientId
+  };
+
+  // set tracker name to avoid collisions with unnamed third party trackers
+  if (opts.nameTracker) {
+    config.name = 'segmentGATracker';
+    this._trackerName = 'segmentGATracker.'; // tracker name must be prepended to all ga method calls with format [name].[method]
+  } else {
+    this._trackerName = ''; // tracker name must be set even if empty to avoid undefined references when prepending
+  }
+  window.ga('create', opts.trackingId, config);
+
+  if (opts.optimize) window.ga(this._trackerName + 'require', opts.optimize);
+
+  // display advertising
+  if (opts.doubleClick) {
+    window.ga(this._trackerName + 'require', 'displayfeatures');
+  }
+
+  // https://support.google.com/analytics/answer/2558867?hl=en
+  if (opts.enhancedLinkAttribution) {
+    window.ga(this._trackerName + 'require', 'linkid', 'linkid.js');
+  }
+
+  // send global id
+  if (opts.sendUserId && user.id()) {
+    window.ga(this._trackerName + 'set', 'userId', user.id());
+  }
+
+  // anonymize after initializing, otherwise a warning is shown
+  // in google analytics debugger
+  if (opts.anonymizeIp)
+    window.ga(this._trackerName + 'set', 'anonymizeIp', true);
+
+  // initialize page with `id` appended to user's traits
+  // sets `id` as a custom dimension for the lifetime of the tracker object and
+  // ensures `id` sent as a custom dimension for all hits on the page
+  var userTraits = user.traits();
+  if (user.id()) {
+    userTraits.id = user.id();
+  }
+
+  // custom dimensions & metrics
+  var custom = metrics(userTraits, opts);
+  if (len(custom)) window.ga(this._trackerName + 'set', custom);
+
+  this.load('library', this.ready);
+};
+
+/**
+ * Loaded?
+ *
+ * @return {Boolean}
+ */
+
+GA.prototype.loaded = function() {
+  return !!window.gaplugins;
+};
+
+/**
+ * Page.
+ *
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/pages
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/single-page-applications#multiple-hits
+ *
+ * @api public
+ * @param {Page} page
+ */
+
+GA.prototype.page = function(page) {
+  var category = page.category();
+  var props = page.properties();
+  var name = page.fullName();
+  var opts = this.options;
+  var campaign = page.proxy('context.campaign') || {};
+  var pageview = {};
+  var pagePath = path(props, this.options);
+  var pageTitle = name || props.title;
+  var pageReferrer = page.referrer() || '';
+  var self = this;
+  var track;
+
+  // store for later
+  // TODO: Why? Document this better
+  this._category = category;
+
+  pageview.page = pagePath;
+  pageview.title = pageTitle;
+  pageview.location = props.url;
+
+  if (campaign.name) pageview.campaignName = campaign.name;
+  if (campaign.source) pageview.campaignSource = campaign.source;
+  if (campaign.medium) pageview.campaignMedium = campaign.medium;
+  if (campaign.content) pageview.campaignContent = campaign.content;
+  if (campaign.term) pageview.campaignKeyword = campaign.term;
+
+  // set
+  var payload = {
+    page: pagePath,
+    title: pageTitle
+  };
+
+  // Reset custom dimension which are previously set.
+  // Uses the configured dimensions as:
+  // opts.dimensions: { "fruit": "dimension1" }
+  // opts.resetCustomDimensions: [ "fruit" ]
+  // --> resetCustomDimensions: { "dimension1": null }
+  var resetCustomDimensions = {};
+  for (var i = 0; i < opts.resetCustomDimensionsOnPage.length; i++) {
+    var property = opts.resetCustomDimensionsOnPage[i];
+    if (opts.dimensions[property]) {
+      resetCustomDimensions[opts.dimensions[property]] = null;
+    }
+  }
+  window.ga(self._trackerName + 'set', resetCustomDimensions);
+
+  pageview = extend(
+    pageview,
+    setCustomDimenionsAndMetrics(props, opts, self._trackerName)
+  );
+
+  if (pageReferrer !== document.referrer) payload.referrer = pageReferrer; // allow referrer override if referrer was manually set
+  window.ga(this._trackerName + 'set', payload);
+
+  if (this.pageCalled) delete pageview.location;
+
+  // send
+  window.ga(this._trackerName + 'send', 'pageview', pageview);
+
+  // categorized pages
+  if (category && this.options.trackCategorizedPages) {
+    track = page.track(category);
+    this.track(track, { nonInteraction: 1 });
+  }
+
+  // named pages
+  if (name && this.options.trackNamedPages) {
+    track = page.track(name);
+    this.track(track, { nonInteraction: 1 });
+  }
+
+  this.pageCalled = true;
+};
+
+/**
+ * Identify.
+ *
+ * @api public
+ * @param {Identify} event
+ */
+
+GA.prototype.identify = function(identify) {
+  var opts = this.options;
+
+  if (opts.sendUserId && identify.userId()) {
+    window.ga(this._trackerName + 'set', 'userId', identify.userId());
+  }
+
+  // Set dimensions
+  var custom = metrics(identify.traits(), opts);
+  if (len(custom)) window.ga(this._trackerName + 'set', custom);
+};
+
+/**
+ * Track.
+ *
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/events
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/field-reference
+ *
+ * @param {Track} event
+ */
+
+GA.prototype.track = function(track, options) {
+  var contextOpts = track.options(this.name);
+  var interfaceOpts = this.options;
+  var opts = defaults(options || {}, contextOpts);
+  opts = defaults(opts, interfaceOpts);
+  var props = track.properties();
+  var campaign = track.proxy('context.campaign') || {};
+  var self = this;
+
+  var payload = {
+    eventAction: track.event(),
+    eventCategory: track.category() || this._category || 'All',
+    eventLabel: props.label,
+    eventValue: formatValue(props.value || track.revenue()),
+    // Allow users to override their nonInteraction integration setting for any single particluar event.
+    nonInteraction:
+      props.nonInteraction !== undefined
+        ? !!props.nonInteraction
+        : !!opts.nonInteraction
+  };
+
+  if (campaign.name) payload.campaignName = campaign.name;
+  if (campaign.source) payload.campaignSource = campaign.source;
+  if (campaign.medium) payload.campaignMedium = campaign.medium;
+  if (campaign.content) payload.campaignContent = campaign.content;
+  if (campaign.term) payload.campaignKeyword = campaign.term;
+
+  payload = extend(
+    payload,
+    setCustomDimenionsAndMetrics(props, interfaceOpts, self._trackerName)
+  );
+
+  window.ga(this._trackerName + 'send', 'event', payload);
+};
+
+/**
+ * Order completed.
+ *
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/ecommerce
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/ecommerce#multicurrency
+ *
+ * @param {Track} track
+ * @api private
+ */
+
+GA.prototype.orderCompleted = function(track) {
+  var total = track.total() || track.revenue() || 0;
+  var orderId = track.orderId();
+  var products = track.products();
+  var props = track.properties();
+  var self = this;
+
+  // orderId is required.
+  if (!orderId) return;
+
+  // require ecommerce
+  if (!this.ecommerce) {
+    window.ga(this._trackerName + 'require', 'ecommerce');
+    this.ecommerce = true;
+  }
+
+  // add transaction
+  window.ga(this._trackerName + 'ecommerce:addTransaction', {
+    affiliation: props.affiliation,
+    shipping: track.shipping(),
+    revenue: total,
+    tax: track.tax(),
+    id: orderId,
+    currency: track.currency()
+  });
+
+  // add products
+  each(products, function(product) {
+    var productTrack = createProductTrack(track, product);
+    window.ga(self._trackerName + 'ecommerce:addItem', {
+      category: productTrack.category(),
+      quantity: productTrack.quantity(),
+      price: productTrack.price(),
+      name: productTrack.name(),
+      sku: productTrack.sku(),
+      id: orderId,
+      currency: productTrack.currency()
+    });
+  });
+
+  // send
+  window.ga(this._trackerName + 'ecommerce:send');
+};
+
+/**
+ * Initialize (classic).
+ *
+ * https://developers.google.com/analytics/devguides/collection/gajs/methods/gaJSApiBasicConfiguration
+ */
+
+GA.prototype.initializeClassic = function() {
+  var opts = this.options;
+  var anonymize = opts.anonymizeIp;
+  var domain = opts.domain;
+  var enhanced = opts.enhancedLinkAttribution;
+  var ignore = opts.ignoredReferrers;
+  var sample = opts.siteSpeedSampleRate;
+
+  window._gaq = window._gaq || [];
+  push('_setAccount', opts.trackingId);
+  push('_setAllowLinker', true);
+
+  if (anonymize) push('_gat._anonymizeIp');
+  if (domain) push('_setDomainName', domain);
+  if (sample) push('_setSiteSpeedSampleRate', sample);
+
+  if (enhanced) {
+    var protocol = document.location.protocol === 'https:' ? 'https:' : 'http:';
+    var pluginUrl =
+      protocol + '//www.google-analytics.com/plugins/ga/inpage_linkid.js';
+    push('_require', 'inpage_linkid', pluginUrl);
+  }
+
+  if (ignore) {
+    if (!is.array(ignore)) ignore = [ignore];
+    each(ignore, function(domain) {
+      push('_addIgnoredRef', domain);
+    });
+  }
+
+  if (this.options.doubleClick) {
+    this.load('double click', this.ready);
+  } else {
+    var name = useHttps() ? 'https' : 'http';
+    this.load(name, this.ready);
+  }
+};
+
+/**
+ * Loaded? (classic)
+ *
+ * @return {Boolean}
+ */
+
+GA.prototype.loadedClassic = function() {
+  return !!(window._gaq && window._gaq.push !== Array.prototype.push);
+};
+
+/**
+ * Page (classic).
+ *
+ * https://developers.google.com/analytics/devguides/collection/gajs/methods/gaJSApiBasicConfiguration
+ *
+ * @param {Page} page
+ */
+
+GA.prototype.pageClassic = function(page) {
+  var category = page.category();
+  var props = page.properties();
+  var name = page.fullName();
+  var track;
+
+  push('_trackPageview', path(props, this.options));
+
+  // categorized pages
+  if (category && this.options.trackCategorizedPages) {
+    track = page.track(category);
+    this.track(track, { nonInteraction: 1 });
+  }
+
+  // named pages
+  if (name && this.options.trackNamedPages) {
+    track = page.track(name);
+    this.track(track, { nonInteraction: 1 });
+  }
+};
+
+/**
+ * Track (classic).
+ *
+ * https://developers.google.com/analytics/devguides/collection/gajs/methods/gaJSApiEventTracking
+ *
+ * @param {Track} track
+ */
+
+GA.prototype.trackClassic = function(track, options) {
+  var opts = options || track.options(this.name);
+  var props = track.properties();
+  var revenue = track.revenue();
+  var event = track.event();
+  var category = this._category || track.category() || 'All';
+  var label = props.label;
+  var value = formatValue(revenue || props.value);
+  var nonInteraction = !!(props.nonInteraction || opts.nonInteraction);
+  push('_trackEvent', category, event, label, value, nonInteraction);
+};
+
+/**
+ * Completed order.
+ *
+ * https://developers.google.com/analytics/devguides/collection/gajs/gaTrackingEcommerce
+ * https://developers.google.com/analytics/devguides/collection/gajs/gaTrackingEcommerce#localcurrencies
+ *
+ * @param {Track} track
+ * @api private
+ */
+
+GA.prototype.completedOrderClassic = function(track) {
+  var total = track.total() || track.revenue() || 0;
+  var orderId = track.orderId();
+  var products = track.products() || [];
+  var props = track.properties();
+  var currency = track.currency();
+
+  // required
+  if (!orderId) return;
+
+  // add transaction
+  push(
+    '_addTrans',
+    orderId,
+    props.affiliation,
+    total,
+    track.tax(),
+    track.shipping(),
+    track.city(),
+    track.state(),
+    track.country()
+  );
+
+  // add items
+  each(products, function(product) {
+    var track = new Track({ properties: product });
+    push(
+      '_addItem',
+      orderId,
+      track.sku(),
+      track.name(),
+      track.category(),
+      track.price(),
+      track.quantity()
+    );
+  });
+
+  // send
+  push('_set', 'currencyCode', currency);
+  push('_trackTrans');
+};
+
+/**
+ * Return the path based on `properties` and `options`.
+ *
+ * @param {Object} properties
+ * @param {Object} options
+ * @return {string|undefined}
+ */
+
+function path(properties, options) {
+  if (!properties) return;
+  var str = properties.path;
+  if (options.includeSearch && properties.search) str += properties.search;
+  return str;
+}
+
+/**
+ * Set custom dimensions and metrics
+ *
+ * @param {Properties} props
+ * @param {Options} opts
+ * @param {String} trackerName
+ * @return {Object}
+ */
+
+function setCustomDimenionsAndMetrics(props, opts, trackerName) {
+  var ret = {};
+  var custom = metrics(props, opts);
+  if (len(custom)) {
+    if (opts.setAllMappedProps) {
+      window.ga(trackerName + 'set', custom);
+    } else {
+      // Add custom dimensions / metrics to event payload
+      each(custom, function(key, value) {
+        ret[key] = value;
+      });
+      return ret;
+    }
+  }
+}
+
+/**
+ * Format the value property to Google's liking.
+ *
+ * @param {Number} value
+ * @return {Number}
+ */
+
+function formatValue(value) {
+  if (!value || value < 0) return 0;
+  return Math.round(value);
+}
+
+function getProductPosition(item, products) {
+  var position = item.properties().position;
+  if (
+    typeof position !== 'undefined' &&
+    !Number.isNaN(Number(position)) &&
+    Number(position) > -1
+  ) {
+    // If position passed and is valid positive number.
+    return position;
+  }
+  return (
+    products
+      .map(function(x) {
+        return x.product_id;
+      })
+      .indexOf(item.productId()) + 1
+  );
+}
+
+/**
+ * Map google's custom dimensions, metrics & content groupings with `obj`.
+ *
+ * Example:
+ *
+ *      metrics({ revenue: 1.9 }, { { metrics : { revenue: 'metric8' } });
+ *      // => { metric8: 1.9 }
+ *
+ *      metrics({ revenue: 1.9 }, {});
+ *      // => {}
+ *
+ * @param {Object} obj
+ * @param {Object} data
+ * @return {Object|null}
+ * @api private
+ */
+
+function metrics(obj, data) {
+  var dimensions = data.dimensions;
+  var metrics = data.metrics;
+  var contentGroupings = data.contentGroupings;
+
+  var ret = {};
+
+  each([metrics, dimensions, contentGroupings], function(group) {
+    each(group, function(prop, key) {
+      var value = dot(obj, prop) || obj[prop];
+      if (is.bool(value)) value = value.toString();
+      if (value || value === 0) ret[key] = value;
+    });
+  });
+
+  return ret;
+}
+
+/**
+ * Loads ec.js (unless already loaded)
+ *
+ * @param {Track} track
+ */
+
+GA.prototype.loadEnhancedEcommerce = function(track) {
+  var self = this;
+
+  if (!this.enhancedEcommerceLoaded) {
+    window.ga(self._trackerName + 'require', 'ec');
+    this.enhancedEcommerceLoaded = true;
+  }
+
+  // Ensure we set currency for every hit
+  window.ga(self._trackerName + 'set', '&cu', track.currency());
+};
+
+/**
+ * Pushes an event and all previously set EE data to GA.
+ *
+ * @api private
+ * @param {Track} track
+ */
+
+GA.prototype.pushEnhancedEcommerce = function(track, opts, trackerName) {
+  var self = this;
+  // Send a custom non-interaction event to ensure all EE data is pushed.
+  // Without doing this we'd need to require page display after setting EE data.
+  var args = reject([
+    self._trackerName + 'send',
+    'event',
+    track.category() || 'EnhancedEcommerce',
+    track.event() || 'Action not defined',
+    track.properties().label,
+    extend(
+      { nonInteraction: 1 },
+      setCustomDimenionsAndMetrics(track.properties(), opts, trackerName)
+    )
+  ]);
+
+  // Google expects an event level category. This field should be generic and not scoped to product level category: https://developers.google.com/analytics/devguides/collection/analyticsjs/enhanced-ecommerce#product-click.
+  // These 4 events have a top level `category` field per Segment Ecommerce Spec referencing the product not event.
+  // For these events we will default to set the event category to 'EnhancedEcommerce'
+  var event = track.event().toLowerCase();
+  var eventsWithCategoryFieldProductScoped = [
+    'product clicked',
+    'product added',
+    'product viewed',
+    'product removed'
+  ];
+  if (eventsWithCategoryFieldProductScoped.includes(event)) {
+    args[2] = 'EnhancedEcommerce';
+  }
+  window.ga.apply(window, args);
+};
+
+/**
+ * Started order - Enhanced Ecommerce
+ *
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/enhanced-ecommerce#checkout-steps
+ *
+ * @api private
+ * @param {Track} track
+ */
+
+GA.prototype.checkoutStartedEnhanced = function(track) {
+  // same as viewed checkout step #1
+  this.checkoutStepViewed(track);
+};
+
+/**
+ * Updated order - Enhanced Ecommerce
+ *
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/enhanced-ecommerce#checkout-steps
+ *
+ * @api private
+ * @param {Track} track
+ */
+
+GA.prototype.orderUpdatedEnhanced = function(track) {
+  // Same event as started order - will override
+  this.checkoutStartedEnhanced(track);
+};
+
+/**
+ * Viewed checkout step - Enhanced Ecommerce
+ *
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/enhanced-ecommerce#checkout-steps
+ *
+ * @api private
+ * @param {Track} track
+ */
+
+GA.prototype.checkoutStepViewedEnhanced = function(track) {
+  var products = track.products();
+  var props = track.properties();
+  var options = extractCheckoutOptions(props);
+  var self = this;
+  var opts = this.options;
+
+  this.loadEnhancedEcommerce(track);
+
+  each(products, function(product) {
+    var productTrack = createProductTrack(track, product);
+    enhancedEcommerceTrackProduct(productTrack, self._trackerName, opts);
+  });
+  window.ga(self._trackerName + 'ec:setAction', 'checkout', {
+    step: props.step || 1,
+    option: options || undefined
+  });
+
+  this.pushEnhancedEcommerce(track, opts, self._trackerName);
+};
+
+/**
+ * Completed checkout step - Enhanced Ecommerce
+ *
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/enhanced-ecommerce#checkout-options
+ *
+ * @api private
+ * @param {Track} track
+ */
+
+GA.prototype.checkoutStepCompletedEnhanced = function(track) {
+  var props = track.properties();
+  var options = extractCheckoutOptions(props);
+  var self = this;
+
+  // Only send an event if we have step and options to update
+  if (!props.step || !options) return;
+
+  this.loadEnhancedEcommerce(track);
+
+  window.ga(self._trackerName + 'ec:setAction', 'checkout_option', {
+    step: props.step || 1,
+    option: options
+  });
+
+  window.ga(self._trackerName + 'send', 'event', 'Checkout', 'Option');
+};
+
+/**
+ * Completed order - Enhanced Ecommerce
+ *
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/enhanced-ecommerce#measuring-transactions
+ *
+ * @api private
+ * @param {Track} track
+ */
+
+GA.prototype.orderCompletedEnhanced = function(track) {
+  var total = track.total() || track.revenue() || 0;
+  var orderId = track.orderId();
+  var products = track.products();
+  var props = track.properties();
+  var opts = this.options;
+  var self = this;
+
+  // orderId is required.
+  if (!orderId) return;
+
+  this.loadEnhancedEcommerce(track);
+
+  each(products, function(product) {
+    var productTrack = createProductTrack(track, product);
+    enhancedEcommerceTrackProduct(productTrack, self._trackerName, opts);
+  });
+
+  window.ga(self._trackerName + 'ec:setAction', 'purchase', {
+    id: orderId,
+    affiliation: props.affiliation,
+    revenue: total,
+    tax: track.tax(),
+    shipping: track.shipping(),
+    coupon: track.coupon()
+  });
+
+  this.pushEnhancedEcommerce(track, opts, self._trackerName);
+};
+
+/**
+ * Refunded order - Enhanced Ecommerce
+ *
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/enhanced-ecommerce#measuring-refunds
+ *
+ * @api private
+ * @param {Track} track
+ */
+
+GA.prototype.orderRefundedEnhanced = function(track) {
+  var orderId = track.orderId();
+  var products = track.products();
+  var self = this;
+  var opts = this.options;
+
+  // orderId is required.
+  if (!orderId) return;
+
+  this.loadEnhancedEcommerce(track);
+
+  // Without any products it's a full refund
+  each(products, function(product) {
+    var track = new Track({ properties: product });
+    window.ga(self._trackerName + 'ec:addProduct', {
+      id: track.productId() || track.id() || track.sku(),
+      quantity: track.quantity()
+    });
+  });
+
+  window.ga(self._trackerName + 'ec:setAction', 'refund', {
+    id: orderId
+  });
+
+  this.pushEnhancedEcommerce(track, opts, self._trackerName);
+};
+
+/**
+ * Added product - Enhanced Ecommerce
+ *
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/enhanced-ecommerce#add-remove-cart
+ *
+ * @api private
+ * @param {Track} track
+ */
+
+GA.prototype.productAddedEnhanced = function(track) {
+  var self = this;
+  var opts = this.options;
+
+  this.loadEnhancedEcommerce(track);
+  enhancedEcommerceProductAction(track, 'add', null, self._trackerName, opts);
+  this.pushEnhancedEcommerce(track, opts, self._trackerName);
+};
+
+/**
+ * Removed product - Enhanced Ecommerce
+ *
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/enhanced-ecommerce#add-remove-cart
+ *
+ * @api private
+ * @param {Track} track
+ */
+
+GA.prototype.productRemovedEnhanced = function(track) {
+  var self = this;
+  var opts = this.options;
+
+  this.loadEnhancedEcommerce(track);
+  enhancedEcommerceProductAction(
+    track,
+    'remove',
+    null,
+    self._trackerName,
+    opts
+  );
+  this.pushEnhancedEcommerce(track, opts, self._trackerName);
+};
+
+/**
+ * Viewed product details - Enhanced Ecommerce
+ *
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/enhanced-ecommerce#product-detail-view
+ *
+ * @api private
+ * @param {Track} track
+ */
+
+GA.prototype.productViewedEnhanced = function(track) {
+  var props = track.properties();
+  var data = {};
+  var self = this;
+  var opts = this.options;
+
+  this.loadEnhancedEcommerce(track);
+  // list property is optional
+  if (props.list) data.list = props.list;
+  enhancedEcommerceProductAction(
+    track,
+    'detail',
+    data,
+    self._trackerName,
+    opts
+  );
+  this.pushEnhancedEcommerce(track, opts, self._trackerName);
+};
+
+/**
+ * Clicked product - Enhanced Ecommerce
+ *
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/enhanced-ecommerce#measuring-actions
+ *
+ * @api private
+ * @param {Track} track
+ */
+
+GA.prototype.productClickedEnhanced = function(track) {
+  var props = track.properties();
+  var data = {};
+  var self = this;
+  var opts = this.options;
+
+  this.loadEnhancedEcommerce(track);
+  // list property is optional
+  if (props.list) data.list = props.list;
+  enhancedEcommerceProductAction(track, 'click', data, self._trackerName, opts);
+  this.pushEnhancedEcommerce(track, opts, self._trackerName);
+};
+
+/**
+ * Viewed promotion - Enhanced Ecommerce
+ *
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/enhanced-ecommerce#measuring-promo-impressions
+ *
+ * @api private
+ * @param {Track} track
+ */
+
+GA.prototype.promotionViewedEnhanced = function(track) {
+  var props = track.properties();
+  var self = this;
+  var opts = this.options;
+
+  this.loadEnhancedEcommerce(track);
+  window.ga(self._trackerName + 'ec:addPromo', {
+    id: track.promotionId() || track.id(),
+    name: track.name(),
+    creative: props.creative,
+    position: props.position
+  });
+  this.pushEnhancedEcommerce(track, opts, self._trackerName);
+};
+
+/**
+ * Clicked promotion - Enhanced Ecommerce
+ *
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/enhanced-ecommerce#measuring-promo-clicks
+ *
+ * @api private
+ * @param {Track} track
+ */
+
+GA.prototype.promotionClickedEnhanced = function(track) {
+  var props = track.properties();
+  var self = this;
+  var opts = this.options;
+
+  this.loadEnhancedEcommerce(track);
+  window.ga(self._trackerName + 'ec:addPromo', {
+    id: track.promotionId() || track.id(),
+    name: track.name(),
+    creative: props.creative,
+    position: props.position
+  });
+  window.ga(self._trackerName + 'ec:setAction', 'promo_click', {});
+  this.pushEnhancedEcommerce(track, opts, self._trackerName);
+};
+
+/**
+ * Product List Viewed - Enhanced Ecommerce (Mapped to Product Impression)
+ *
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/enhanced-ecommerce#product-impression
+ *
+ * @api private
+ * @param {Track} track
+ */
+
+GA.prototype.productListViewedEnhanced = function(track) {
+  var props = track.properties();
+  var products = track.products();
+  var self = this;
+  var opts = this.options;
+
+  this.loadEnhancedEcommerce(track);
+
+  each(products, function(product) {
+    // If we don't have an ID/SKU or name, return - GA will reject the impression.
+    var item = new Track({ properties: product });
+    if (!(item.productId() || item.sku()) && !item.name()) return;
+    var impressionObj = {
+      id: item.productId() || item.sku(),
+      name: item.name(),
+      category: item.category() || track.category(),
+      list: props.list_id || track.category() || 'products',
+      brand: item.properties().brand,
+      variant: item.properties().variant,
+      price: item.price(),
+      position: getProductPosition(item, products)
+    };
+
+    impressionObj = extend(impressionObj, metrics(item.properties(), opts));
+
+    for (var prop in impressionObj) {
+      if (impressionObj[prop] === undefined) delete impressionObj[prop];
+    }
+    window.ga(self._trackerName + 'ec:addImpression', impressionObj);
+  });
+
+  this.pushEnhancedEcommerce(track, opts, self._trackerName);
+};
+
+/**
+ * Product List Filtered - Enhanced Ecommerce (Mapped to Product Impression)
+ *
+ * https://developers.google.com/analytics/devguides/collection/analyticsjs/enhanced-ecommerce#product-impression
+ *
+ * @api private
+ * @param {Track} track
+ */
+
+GA.prototype.productListFilteredEnhanced = function(track) {
+  var props = track.properties();
+  var products = track.products();
+  props.filters = props.filters || [];
+  props.sorters = props.sorters || [];
+  var filters = props.filters
+    .map(function(obj) {
+      return obj.type + ':' + obj.value;
+    })
+    .join();
+  var sorts = props.sorts
+    .map(function(obj) {
+      return obj.type + ':' + obj.value;
+    })
+    .join();
+  var self = this;
+  var opts = this.options;
+
+  this.loadEnhancedEcommerce(track);
+  each(products, function(product) {
+    // If we don't have an ID/SKU or name, return - GA will reject the impression.
+    var item = new Track({ properties: product });
+    if (!(item.productId() || item.sku()) && !item.name()) return;
+    var impressionObj = {
+      id: item.productId() || item.sku(),
+      name: item.name(),
+      category: item.category() || track.category(),
+      list: props.list_id || track.category() || 'search results',
+      brand: item.properties().brand,
+      variant: filters + '::' + sorts,
+      price: item.price(),
+      position: getProductPosition(item, products)
+    };
+
+    impressionObj = extend(impressionObj, metrics(item.properties(), opts));
+
+    for (var prop in impressionObj) {
+      if (impressionObj[prop] === undefined) delete impressionObj[prop];
+    }
+    window.ga(self._trackerName + 'ec:addImpression', impressionObj);
+  });
+
+  this.pushEnhancedEcommerce(track, opts, self._trackerName);
+};
+
+/**
+ * Enhanced ecommerce track product.
+ *
+ * Simple helper so that we don't repeat `ec:addProduct` everywhere.
+ *
+ * @api private
+ * @param {Track} track
+ */
+
+function enhancedEcommerceTrackProduct(track, trackerName, opts) {
+  var props = track.properties();
+  var product = {
+    id: track.productId() || track.id() || track.sku(),
+    name: track.name(),
+    category: track.category(),
+    quantity: track.quantity(),
+    price: track.price(),
+    brand: props.brand,
+    variant: props.variant,
+    currency: track.currency()
+  };
+
+  // https://developers.google.com/analytics/devguides/collection/analyticsjs/enhanced-ecommerce#product-data
+  // GA requires an integer but our specs says "Number", so it could be a float.
+  if (props.position != null) {
+    product.position = Math.round(props.position);
+  }
+
+  // append coupon if it set
+  // https://developers.google.com/analytics/devguides/collection/analyticsjs/enhanced-ecommerce#measuring-transactions
+  var coupon = track.proxy('properties.coupon');
+  if (coupon) product.coupon = coupon;
+
+  product = extend(product, metrics(props, opts));
+  window.ga(trackerName + 'ec:addProduct', product);
+}
+
+/**
+ * Set `action` on `track` with `data`.
+ *
+ * @api private
+ * @param {Track} track
+ * @param {String} action
+ * @param {Object} data
+ */
+
+function enhancedEcommerceProductAction(
+  track,
+  action,
+  data,
+  trackerName,
+  opts
+) {
+  enhancedEcommerceTrackProduct(track, trackerName, opts);
+  window.ga(trackerName + 'ec:setAction', action, data || {});
+}
+
+/**
+ * Extracts checkout options.
+ *
+ * @api private
+ * @param {Object} props
+ * @return {string|null}
+ */
+
+function extractCheckoutOptions(props) {
+  var options = [props.paymentMethod, props.shippingMethod];
+
+  // Remove all nulls, and join with commas.
+  var valid = reject(options);
+  return valid.length > 0 ? valid.join(', ') : null;
+}
+
+/**
+ * Creates a track out of product properties.
+ *
+ * @api private
+ * @param {Track} track
+ * @param {Object} properties
+ * @return {Track}
+ */
+
+function createProductTrack(track, properties) {
+  var props = properties || {};
+  props.currency = properties.currency || track.currency();
+  return new Track({ properties: props });
+}
+
+},{"@ndhoule/defaults":6,"@segment/analytics.js-integration":40,"component-each":76,"extend":87,"global-queue":88,"is":94,"obj-case":106,"object-component":107,"reject":109,"segmentio-facade":117,"use-https":130}],32:[function(require,module,exports){
+'use strict';
+
+/**
+ * Module dependencies.
+ */
+
+var integration = require('@segment/analytics.js-integration');
+var push = require('global-queue')('dataLayer', { wrap: false });
+
+/**
+ * Expose `GTM`.
+ */
+
+var GTM = module.exports = integration('Google Tag Manager')
+  .global('dataLayer')
+  .global('google_tag_manager')
+  .option('containerId', '')
+  .option('environment', '')
+  .option('trackNamedPages', true)
+  .option('trackCategorizedPages', true)
+  .tag('no-env', '<script src="//www.googletagmanager.com/gtm.js?id={{ containerId }}&l=dataLayer">')
+  .tag('with-env', '<script src="//www.googletagmanager.com/gtm.js?id={{ containerId }}&l=dataLayer&gtm_preview={{ environment }}">');
+
+/**
+ * Initialize.
+ *
+ * https://developers.google.com/tag-manager
+ *
+ * @api public
+ */
+
+GTM.prototype.initialize = function() {
+  push({ 'gtm.start': Number(new Date()), event: 'gtm.js' });
+
+  if (this.options.environment.length) {
+    this.load('with-env', this.options, this.ready);
+  } else {
+    this.load('no-env', this.options, this.ready);
+  }
+};
+
+/**
+ * Loaded?
+ *
+ * @api private
+ * @return {boolean}
+ */
+
+GTM.prototype.loaded = function() {
+  return !!(window.dataLayer && Array.prototype.push !== window.dataLayer.push);
+};
+
+/**
+ * Page.
+ *
+ * @api public
+ * @param {Page} page
+ */
+
+GTM.prototype.page = function(page) {
+  var category = page.category();
+  var name = page.fullName();
+  var opts = this.options;
+
+  // all
+  if (opts.trackAllPages) {
+    this.track(page.track());
+  }
+
+  // categorized
+  if (category && opts.trackCategorizedPages) {
+    this.track(page.track(category));
+  }
+
+  // named
+  if (name && opts.trackNamedPages) {
+    this.track(page.track(name));
+  }
+};
+
+/**
+ * Track.
+ *
+ * https://developers.google.com/tag-manager/devguide#events
+ *
+ * @api public
+ * @param {Track} track
+ */
+
+GTM.prototype.track = function(track) {
+  var props = track.properties();
+  var userId = this.analytics.user().id();
+  var anonymousId = this.analytics.user().anonymousId();
+  if (userId) props.userId = userId;
+  if (anonymousId) props.segmentAnonymousId = anonymousId;
+  props.event = track.event();
+
+  push(props);
+};
+
+},{"@segment/analytics.js-integration":40,"global-queue":88}],33:[function(require,module,exports){
 'use strict';
 
 /**
@@ -3322,7 +4950,6 @@ var integration = require('@segment/analytics.js-integration');
 var json = require('json3');
 var keys = require('@ndhoule/keys');
 var localstorage = require('yields-store');
-var md5 = require('spark-md5').hash;
 var protocol = require('@segment/protocol');
 var send = require('@segment/send-json');
 var topDomain = require('@segment/top-domain');
@@ -3340,7 +4967,6 @@ var cookieOptions = {
   secure: false,
   path: '/'
 };
-
 
 /**
  * Segment messages can be a maximum of 32kb.
@@ -3367,13 +4993,15 @@ var queueOptions = {
  * Expose `Segment` integration.
  */
 
-var Segment = exports = module.exports = integration('Segment.io')
+var Segment = (exports = module.exports = integration('Segment.io')
   .option('apiKey', '')
   .option('apiHost', 'api.segment.io/v1')
   .option('crossDomainIdServers', [])
+  .option('deleteCrossDomainId', false)
+  .option('saveCrossDomainIdInLocalStorage', true)
   .option('retryQueue', true)
   .option('addBundledMetadata', false)
-  .option('unbundledIntegrations', []);
+  .option('unbundledIntegrations', []));
 
 /**
  * Get the store.
@@ -3382,7 +5010,9 @@ var Segment = exports = module.exports = integration('Segment.io')
  */
 
 exports.storage = function() {
-  return protocol() === 'file:' || protocol() === 'chrome-extension:' ? localstorage : cookie;
+  return protocol() === 'file:' || protocol() === 'chrome-extension:'
+    ? localstorage
+    : cookie;
 };
 
 /**
@@ -3390,7 +5020,6 @@ exports.storage = function() {
  */
 
 exports.global = window;
-
 
 /**
  * Send the given `obj` and `headers` to `url` with the specified `timeout` and
@@ -3432,7 +5061,7 @@ exports.sendJsonWithTimeout = function(url, obj, headers, timeout, fn) {
   function done() {
     if (req.readyState === 4) {
       // Fail on 429 and 5xx HTTP errors
-      if (req.status === 429 || req.status >= 500 && req.status < 600) {
+      if (req.status === 429 || (req.status >= 500 && req.status < 600)) {
         fn(new Error('HTTP Error ' + req.status + ' (' + req.statusText + ')'));
       } else {
         fn(null, req);
@@ -3453,17 +5082,24 @@ Segment.prototype.initialize = function() {
   var self = this;
 
   if (this.options.retryQueue) {
-    this._lsqueue = new Queue('segmentio', queueOptions, function(item, done) {
+    this._lsqueue = new Queue('segmentio', queueOptions, function(elem, done) {
       // apply sentAt at flush time and reset on each retry
       // so the tracking-api doesn't interpret a time skew
+      var item = elem;
       item.msg.sentAt = new Date();
 
       // send with 10s timeout
-      Segment.sendJsonWithTimeout(item.url, item.msg, item.headers, 10 * 1000, function(err, res) {
-        self.debug('sent %O, received %O', item.msg, [err, res]);
-        if (err) return done(err);
-        done(null, res);
-      });
+      Segment.sendJsonWithTimeout(
+        item.url,
+        item.msg,
+        item.headers,
+        10 * 1000,
+        function(err, res) {
+          self.debug('sent %O, received %O', item.msg, [err, res]);
+          if (err) return done(err);
+          done(null, res);
+        }
+      );
     });
 
     this._lsqueue.start();
@@ -3479,20 +5115,13 @@ Segment.prototype.initialize = function() {
     self.ready();
   });
 
-  // Migrate from old cross domain id cookie names
-  if (this.cookie('segment_cross_domain_id')) {
-    this.cookie('seg_xid', this.cookie('segment_cross_domain_id'));
-    this.cookie('seg_xid_fd', this.cookie('segment_cross_domain_id_from_domain'));
-    this.cookie('seg_xid_ts', this.cookie('segment_cross_domain_id_timestamp'));
-    this.cookie('segment_cross_domain_id', null);
-    this.cookie('segment_cross_domain_id_from_domain', null);
-    this.cookie('segment_cross_domain_id_timestamp', null);
-  }
+  // Delete cross domain identifiers.
+  this.deleteCrossDomainIdIfNeeded();
 
   // At this moment we intentionally do not want events to be queued while we retrieve the `crossDomainId`
   // so `.ready` will get called right away and we'll try to figure out `crossDomainId`
   // separately
-  if (this.options.crossDomainIdServers && this.options.crossDomainIdServers.length > 0) {
+  if (this.isCrossDomainAnalyticsEnabled()) {
     this.retrieveCrossDomainId();
   }
 };
@@ -3567,7 +5196,8 @@ Segment.prototype.ontrack = function(track) {
 Segment.prototype.onalias = function(alias) {
   var json = alias.json();
   var user = this.analytics.user();
-  json.previousId = json.previousId || json.from || user.id() || user.anonymousId();
+  json.previousId =
+    json.previousId || json.from || user.id() || user.anonymousId();
   json.userId = json.userId || json.to;
   delete json.from;
   delete json.to;
@@ -3581,22 +5211,30 @@ Segment.prototype.onalias = function(alias) {
  * @param {Object} msg
  */
 
-Segment.prototype.normalize = function(msg) {
+Segment.prototype.normalize = function(message) {
+  var msg = message;
   this.debug('normalize %o', msg);
   var user = this.analytics.user();
   var global = exports.global;
   var query = global.location.search;
-  var ctx = msg.context = msg.context || msg.options || {};
+  var ctx = (msg.context = msg.context || msg.options || {});
   delete msg.options;
   msg.writeKey = this.options.apiKey;
   ctx.userAgent = navigator.userAgent;
-  if (!ctx.library) ctx.library = { name: 'analytics.js', version: this.analytics.VERSION };
-  var crossDomainId = this.cookie('seg_xid');
-  if (crossDomainId) {
-    if (!ctx.traits) {
-      ctx.traits = { crossDomainId: crossDomainId };
-    } else if (!ctx.traits.crossDomainId) {
-      ctx.traits.crossDomainId = crossDomainId;
+  var locale = navigator.userLanguage || navigator.language;
+  if (typeof ctx.locale === 'undefined' && typeof locale !== 'undefined') {
+    ctx.locale = locale;
+  }
+  if (!ctx.library)
+    ctx.library = { name: 'analytics.js', version: this.analytics.VERSION };
+  if (this.isCrossDomainAnalyticsEnabled()) {
+    var crossDomainId = this.getCachedCrossDomainId();
+    if (crossDomainId) {
+      if (!ctx.traits) {
+        ctx.traits = { crossDomainId: crossDomainId };
+      } else if (!ctx.traits.crossDomainId) {
+        ctx.traits.crossDomainId = crossDomainId;
+      }
     }
   }
   // if user provides campaign via context, do not overwrite with UTM qs param
@@ -3618,8 +5256,6 @@ Segment.prototype.normalize = function(msg) {
     msg._metadata.bundled = bundled;
     msg._metadata.unbundled = this.options.unbundledIntegrations;
   }
-  // add some randomness to the messageId checksum
-  msg.messageId = 'ajs-' + md5(json.stringify(msg) + uuid());
   this.debug('normalized %o', msg);
   this.ampId(ctx);
   return msg;
@@ -3645,10 +5281,10 @@ Segment.prototype.ampId = function(ctx) {
  * @param {Function} fn
  */
 
-Segment.prototype.enqueue = function(path, msg, fn) {
+Segment.prototype.enqueue = function(path, message, fn) {
   var url = 'https://' + this.options.apiHost + path;
   var headers = { 'Content-Type': 'text/plain' };
-  msg = this.normalize(msg);
+  var msg = this.normalize(message);
 
   // Print a log statement when messages exceed the maximum size. In the future,
   // we may consider dropping this event on the client entirely.
@@ -3726,6 +5362,20 @@ Segment.prototype.referrerId = function(query, ctx) {
   this.cookie('s:context.referrer', json.stringify(ad));
 };
 
+/**
+ * isCrossDomainAnalyticsEnabled returns true if cross domain analytics is enabled.
+ * This field is not directly supplied, so it is inferred by inspecting the
+ * `crossDomainIdServers` array in settings. If this array is null or empty,
+ * it is assumed that cross domain analytics is disabled.
+ *
+ * @api private
+ */
+Segment.prototype.isCrossDomainAnalyticsEnabled = function() {
+  if (!this.options.crossDomainIdServers) {
+    return false;
+  }
+  return this.options.crossDomainIdServers.length > 0;
+};
 
 /**
  * retrieveCrossDomainId.
@@ -3734,60 +5384,169 @@ Segment.prototype.referrerId = function(query, ctx) {
  * @param {function) callback => err, {crossDomainId, fromServer, timestamp}
  */
 Segment.prototype.retrieveCrossDomainId = function(callback) {
-  if (!this.options.crossDomainIdServers) {
+  if (!this.isCrossDomainAnalyticsEnabled()) {
+    // Callback is only provided in tests.
     if (callback) {
       callback('crossDomainId not enabled', null);
     }
     return;
   }
-  if (!this.cookie('seg_xid')) {
-    var self = this;
-    var writeKey = this.options.apiKey;
 
-    // Exclude the current domain from the list of servers we're querying
-    var currentTld = getTld(window.location.hostname);
-    var domains = [];
-    for (var i=0; i<this.options.crossDomainIdServers.length; i++) {
-      var domain = this.options.crossDomainIdServers[i];
-      if (getTld(domain) !== currentTld) {
-        domains.push(domain);
+  var cachedCrossDomainId = this.getCachedCrossDomainId();
+  if (cachedCrossDomainId) {
+    // Callback is only provided in tests.
+    if (callback) {
+      callback(null, {
+        crossDomainId: cachedCrossDomainId
+      });
+    }
+    return;
+  }
+
+  var self = this;
+  var writeKey = this.options.apiKey;
+
+  // Exclude the current domain from the list of servers we're querying
+  var currentTld = getTld(window.location.hostname);
+  var domains = [];
+  for (var i = 0; i < this.options.crossDomainIdServers.length; i++) {
+    var domain = this.options.crossDomainIdServers[i];
+    if (getTld(domain) !== currentTld) {
+      domains.push(domain);
+    }
+  }
+
+  getCrossDomainIdFromServerList(domains, writeKey, function(err, res) {
+    if (err) {
+      // Callback is only provided in tests.
+      if (callback) {
+        callback(err, null);
       }
+      // We optimize for no conflicting xid as much as possible. So bail out if there is an
+      // error and we cannot be sure that xid does not exist on any other domains.
+      return;
     }
 
-    getCrossDomainIdFromServerList(domains, writeKey, function(err, res) {
-      if (err) {
-        // We optimize for no conflicting xid as much as possible. So bail out if there is an
-        // error and we cannot be sure that xid does not exist on any other domains
-        if (callback) {
-          callback(err, null);
-        }
-        return;
-      }
-      var crossDomainId = null;
-      var fromDomain = null;
-      if (res) {
-        crossDomainId = res.id;
-        fromDomain = res.domain;
-      } else {
-        crossDomainId = uuid();
-        fromDomain = window.location.hostname;
-      }
-      var currentTimeMillis = (new Date()).getTime();
-      self.cookie('seg_xid', crossDomainId);
-      // Not actively used. Saving for future conflict resolution purposes
-      self.cookie('seg_xid_fd', fromDomain);
-      self.cookie('seg_xid_ts', currentTimeMillis);
-      self.analytics.identify({
-        crossDomainId: crossDomainId
-      });
-      if (callback) {
-        callback(null, {
-          crossDomainId: crossDomainId,
-          fromDomain: fromDomain,
-          timestamp: currentTimeMillis
-        });
-      }
+    var crossDomainId = null;
+    var fromDomain = null;
+    if (res) {
+      crossDomainId = res.id;
+      fromDomain = res.domain;
+    } else {
+      crossDomainId = uuid();
+      fromDomain = window.location.hostname;
+    }
+
+    self.saveCrossDomainId(crossDomainId);
+    self.analytics.identify({
+      crossDomainId: crossDomainId
     });
+
+    // Callback is only provided in tests.
+    if (callback) {
+      callback(null, {
+        crossDomainId: crossDomainId,
+        fromDomain: fromDomain
+      });
+    }
+  });
+};
+
+/**
+ * getCachedCrossDomainId returns the cross domain identifier stored on the client based on the `saveCrossDomainIdInLocalStorage` flag.
+ * If `saveCrossDomainIdInLocalStorage` is false, it reads it from the `seg_xid` cookie.
+ * If `saveCrossDomainIdInLocalStorage` is true, it reads it from the `seg_xid` key in localStorage.
+ *
+ * @return {string} crossDomainId
+ */
+Segment.prototype.getCachedCrossDomainId = function() {
+  if (this.options.saveCrossDomainIdInLocalStorage) {
+    return localstorage('seg_xid');
+  }
+  return this.cookie('seg_xid');
+};
+
+/**
+ * saveCrossDomainId saves the cross domain identifier. The implementation differs based on the `saveCrossDomainIdInLocalStorage` flag.
+ * If `saveCrossDomainIdInLocalStorage` is false, it saves it as the `seg_xid` cookie.
+ * If `saveCrossDomainIdInLocalStorage` is true, it saves it to localStorage (so that it can be accessed on the current domain)
+ * and as a httpOnly cookie (so that can it can be provided to other domains).
+ *
+ * @api private
+ */
+Segment.prototype.saveCrossDomainId = function(crossDomainId) {
+  if (!this.options.saveCrossDomainIdInLocalStorage) {
+    this.cookie('seg_xid', crossDomainId);
+    return;
+  }
+
+  var self = this;
+
+  // Save the cookie by making a request to the xid server for the current domain.
+  var currentTld = getTld(window.location.hostname);
+  for (var i = 0; i < this.options.crossDomainIdServers.length; i++) {
+    var domain = this.options.crossDomainIdServers[i];
+    if (getTld(domain) === currentTld) {
+      var writeKey = this.options.apiKey;
+      var url =
+        'https://' +
+        domain +
+        '/v1/saveId?writeKey=' +
+        writeKey +
+        '&xid=' +
+        crossDomainId;
+
+      httpGet(url, function(err, res) {
+        if (err) {
+          self.debug('could not save id on %O, received %O', url, [err, res]);
+          return;
+        }
+
+        localstorage('seg_xid', crossDomainId);
+      });
+      return;
+    }
+  }
+};
+
+/**
+ * Deletes any state persisted by cross domain analytics.
+ * * seg_xid (and metadata) from cookies
+ * * seg_xid from localStorage
+ * * crossDomainId from traits in localStorage
+ *
+ * The deletion logic is run only if deletion is enabled for this project, and only
+ * deletes the data that actually exists.
+ *
+ * @api private
+ */
+Segment.prototype.deleteCrossDomainIdIfNeeded = function() {
+  // Only continue if deletion is enabled for this project.
+  if (!this.options.deleteCrossDomainId) {
+    return;
+  }
+
+  // Delete the xid cookie if it exists. We also delete associated metadata.
+  if (this.cookie('seg_xid')) {
+    this.cookie('seg_xid', null);
+    this.cookie('seg_xid_fd', null);
+    this.cookie('seg_xid_ts', null);
+  }
+
+  // Delete the xid from localStorage if it exists.
+  if (localstorage('seg_xid')) {
+    localstorage('seg_xid', null);
+  }
+
+  // Delete the crossDomainId trait in localStorage if it exists.
+  if (this.analytics.user().traits().crossDomainId) {
+    // This intentionally uses an internal API, so that
+    // we can avoid interacting with lower level localStorage APIs, and instead
+    // leverage existing functionality inside analytics.js.
+
+    var traits = this.analytics.user().traits();
+    delete traits.crossDomainId;
+    this.analytics.user()._setTraits(traits);
   }
 };
 
@@ -3805,7 +5564,7 @@ function getCrossDomainIdFromServerList(domains, writeKey, callback) {
   var crossDomainIdFound = false;
   var finishedRequests = 0;
   var error = null;
-  for (var i=0; i<domains.length; i++) {
+  for (var i = 0; i < domains.length; i++) {
     var domain = domains[i];
 
     getCrossDomainIdFromSingleServer(domain, writeKey, function(err, res) {
@@ -3842,7 +5601,7 @@ function getCrossDomainIdFromSingleServer(domain, writeKey, callback) {
     } else {
       callback(null, {
         domain: domain,
-        id: res && res.id || null
+        id: (res && res.id) || null
       });
     }
   });
@@ -3870,16 +5629,40 @@ function getJson(url, callback) {
 }
 
 /**
+ * get makes a get request to the given URL.
+ * @param {string} url
+ * @param {function} callback => err, response
+ */
+function httpGet(url, callback) {
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', url, true);
+  xhr.withCredentials = true;
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState === XMLHttpRequest.DONE) {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        callback(null, xhr.responseText);
+      } else {
+        callback(xhr.statusText || xhr.responseText || 'Unknown Error', null);
+      }
+    }
+  };
+  xhr.send();
+}
+
+/**
  * getTld
  * Get domain.com from subdomain.domain.com, etc.
  * @param {string} domain
  * @return {string} tld
  */
 function getTld(domain) {
-  return domain.split('.').splice(-2).join('.');
+  return domain
+    .split('.')
+    .splice(-2)
+    .join('.');
 }
 
-},{"@ndhoule/extend":10,"@ndhoule/keys":13,"@segment/ad-params":17,"@segment/analytics.js-integration":31,"@segment/localstorage-retry":45,"@segment/protocol":54,"@segment/send-json":55,"@segment/top-domain":57,"@segment/utm-params":58,"component-clone":61,"component-cookie":62,"json3":82,"spark-md5":109,"uuid":117,"yields-store":118}],31:[function(require,module,exports){
+},{"@ndhoule/extend":10,"@ndhoule/keys":13,"@segment/ad-params":17,"@segment/analytics.js-integration":34,"@segment/localstorage-retry":54,"@segment/protocol":63,"@segment/send-json":64,"@segment/top-domain":66,"@segment/utm-params":67,"component-clone":71,"component-cookie":72,"json3":95,"uuid":133,"yields-store":134}],34:[function(require,module,exports){
 'use strict';
 
 /**
@@ -3944,7 +5727,7 @@ function createIntegration(name) {
 
 module.exports = createIntegration;
 
-},{"./protos":32,"./statics":33,"@ndhoule/clone":5,"@ndhoule/defaults":6,"@ndhoule/extend":10,"component-bind":60,"debug":35,"slug-component":108}],32:[function(require,module,exports){
+},{"./protos":35,"./statics":36,"@ndhoule/clone":5,"@ndhoule/defaults":6,"@ndhoule/extend":10,"component-bind":70,"debug":38,"slug-component":123}],35:[function(require,module,exports){
 'use strict';
 
 /**
@@ -4420,7 +6203,7 @@ function render(template, locals) {
   }, {}, template.attrs);
 }
 
-},{"@ndhoule/after":3,"@ndhoule/each":8,"@ndhoule/every":9,"@ndhoule/foldl":11,"@segment/fmt":39,"@segment/load-script":43,"analytics-events":34,"component-emitter":68,"is":81,"load-iframe":86,"next-tick":92,"to-no-case":112}],33:[function(require,module,exports){
+},{"@ndhoule/after":3,"@ndhoule/each":8,"@ndhoule/every":9,"@ndhoule/foldl":11,"@segment/fmt":48,"@segment/load-script":52,"analytics-events":37,"component-emitter":78,"is":94,"load-iframe":99,"next-tick":105,"to-no-case":127}],36:[function(require,module,exports){
 'use strict';
 
 /**
@@ -4585,7 +6368,7 @@ function objectify(str) {
   };
 }
 
-},{"@ndhoule/each":8,"@ndhoule/includes":12,"component-emitter":68,"domify":76}],34:[function(require,module,exports){
+},{"@ndhoule/each":8,"@ndhoule/includes":12,"component-emitter":78,"domify":86}],37:[function(require,module,exports){
 
 module.exports = {
   // Promotions
@@ -4652,7 +6435,7 @@ module.exports = {
   pushNotificationBounced: /^[ _]?push[ _]?notification[ _]?bounced[ _]?$/i
 };
 
-},{}],35:[function(require,module,exports){
+},{}],38:[function(require,module,exports){
 (function (process){
 /**
  * This is the web browser implementation of `debug()`.
@@ -4841,7 +6624,7 @@ function localstorage() {
 }
 
 }).call(this,require('_process'))
-},{"./debug":36,"_process":94}],36:[function(require,module,exports){
+},{"./debug":39,"_process":108}],39:[function(require,module,exports){
 
 /**
  * This is the common logic for both the Node.js and web browser
@@ -5045,7 +6828,799 @@ function coerce(val) {
   return val;
 }
 
-},{"ms":87}],37:[function(require,module,exports){
+},{"ms":100}],40:[function(require,module,exports){
+'use strict';
+
+/**
+ * Module dependencies.
+ */
+
+var bind = require('component-bind');
+var debug = require('debug');
+var defaults = require('@ndhoule/defaults');
+var extend = require('extend');
+var slug = require('slug-component');
+var protos = require('./protos');
+var statics = require('./statics');
+
+/**
+ * Create a new `Integration` constructor.
+ *
+ * @constructs Integration
+ * @param {string} name
+ * @return {Function} Integration
+ */
+
+function createIntegration(name) {
+  /**
+   * Initialize a new `Integration`.
+   *
+   * @class
+   * @param {Object} options
+   */
+
+  function Integration(options) {
+    if (options && options.addIntegration) {
+      // plugin
+      return options.addIntegration(Integration);
+    }
+    this.debug = debug('analytics:integration:' + slug(name));
+    var clonedOpts = {};
+    extend(true, clonedOpts, options); // deep clone options
+    this.options = defaults(clonedOpts || {}, this.defaults);
+    this._queue = [];
+    this.once('ready', bind(this, this.flush));
+
+    Integration.emit('construct', this);
+    this.ready = bind(this, this.ready);
+    this._wrapInitialize();
+    this._wrapPage();
+    this._wrapTrack();
+  }
+
+  Integration.prototype.defaults = {};
+  Integration.prototype.globals = [];
+  Integration.prototype.templates = {};
+  Integration.prototype.name = name;
+  extend(Integration, statics);
+  extend(Integration.prototype, protos);
+
+  return Integration;
+}
+
+/**
+ * Exports.
+ */
+
+module.exports = createIntegration;
+
+},{"./protos":41,"./statics":42,"@ndhoule/defaults":6,"component-bind":70,"debug":43,"extend":45,"slug-component":123}],41:[function(require,module,exports){
+'use strict';
+
+/**
+ * Module dependencies.
+ */
+
+var Emitter = require('component-emitter');
+var each = require('@ndhoule/each');
+var events = require('analytics-events');
+var every = require('@ndhoule/every');
+var fmt = require('@segment/fmt');
+var foldl = require('@ndhoule/foldl');
+var is = require('is');
+var loadIframe = require('load-iframe');
+var loadScript = require('@segment/load-script');
+var nextTick = require('next-tick');
+var normalize = require('to-no-case');
+
+/**
+ * hasOwnProperty reference.
+ */
+
+var has = Object.prototype.hasOwnProperty;
+
+/**
+ * No operation.
+ */
+
+var noop = function noop() {};
+
+/**
+ * Window defaults.
+ */
+
+var onerror = window.onerror;
+var onload = null;
+
+/**
+ * Mixin emitter.
+ */
+
+/* eslint-disable new-cap */
+Emitter(exports);
+/* eslint-enable new-cap */
+
+/**
+ * Initialize.
+ */
+
+exports.initialize = function() {
+  var ready = this.ready;
+  nextTick(ready);
+};
+
+/**
+ * Loaded?
+ *
+ * @api private
+ * @return {boolean}
+ */
+
+exports.loaded = function() {
+  return false;
+};
+
+/**
+ * Page.
+ *
+ * @api public
+ * @param {Page} page
+ */
+
+/* eslint-disable no-unused-vars */
+exports.page = function(page) {};
+/* eslint-enable no-unused-vars */
+
+/**
+ * Track.
+ *
+ * @api public
+ * @param {Track} track
+ */
+
+/* eslint-disable no-unused-vars */
+exports.track = function(track) {};
+/* eslint-enable no-unused-vars */
+
+/**
+ * Get values from items in `options` that are mapped to `key`.
+ * `options` is an integration setting which is a collection
+ * of type 'map', 'array', or 'mixed'
+ *
+ * Use cases include mapping events to pixelIds (map), sending generic
+ * conversion pixels only for specific events (array), or configuring dynamic
+ * mappings of event properties to query string parameters based on event (mixed)
+ *
+ * @api public
+ * @param {Object|Object[]|String[]} options An object, array of objects, or
+ * array of strings pulled from settings.mapping.
+ * @param {string} key The name of the item in options whose metadata
+ * we're looking for.
+ * @return {Array} An array of settings that match the input `key` name.
+ * @example
+ *
+ * // 'Map'
+ * var events = { my_event: 'a4991b88' };
+ * .map(events, 'My Event');
+ * // => ["a4991b88"]
+ * .map(events, 'whatever');
+ * // => []
+ *
+ * // 'Array'
+ * * var events = ['Completed Order', 'My Event'];
+ * .map(events, 'My Event');
+ * // => ["My Event"]
+ * .map(events, 'whatever');
+ * // => []
+ *
+ * // 'Mixed'
+ * var events = [{ key: 'my event', value: '9b5eb1fa' }];
+ * .map(events, 'my_event');
+ * // => ["9b5eb1fa"]
+ * .map(events, 'whatever');
+ * // => []
+ */
+
+exports.map = function(options, key) {
+  var normalizedComparator = normalize(key);
+  var mappingType = getMappingType(options);
+
+  if (mappingType === 'unknown') {
+    return [];
+  }
+
+  return foldl(function(matchingValues, val, key) {
+    var compare;
+    var result;
+
+    if (mappingType === 'map') {
+      compare = key;
+      result = val;
+    }
+
+    if (mappingType === 'array') {
+      compare = val;
+      result = val;
+    }
+
+    if (mappingType === 'mixed') {
+      compare = val.key;
+      result = val.value;
+    }
+
+    if (normalize(compare) === normalizedComparator) {
+      matchingValues.push(result);
+    }
+
+    return matchingValues;
+  }, [], options);
+};
+
+/**
+ * Invoke a `method` that may or may not exist on the prototype with `args`,
+ * queueing or not depending on whether the integration is "ready". Don't
+ * trust the method call, since it contains integration party code.
+ *
+ * @api private
+ * @param {string} method
+ * @param {...*} args
+ */
+
+exports.invoke = function(method) {
+  if (!this[method]) return;
+  var args = Array.prototype.slice.call(arguments, 1);
+  if (!this._ready) return this.queue(method, args);
+
+  this.debug('%s with %o', method, args);
+  return this[method].apply(this, args);
+};
+
+/**
+ * Queue a `method` with `args`.
+ *
+ * @api private
+ * @param {string} method
+ * @param {Array} args
+ */
+
+exports.queue = function(method, args) {
+  this._queue.push({ method: method, args: args });
+};
+
+/**
+ * Flush the internal queue.
+ *
+ * @api private
+ */
+
+exports.flush = function() {
+  this._ready = true;
+  var self = this;
+
+  each(function(call) {
+    self[call.method].apply(self, call.args);
+  }, this._queue);
+
+  // Empty the queue.
+  this._queue.length = 0;
+};
+
+/**
+ * Reset the integration, removing its global variables.
+ *
+ * @api private
+ */
+
+exports.reset = function() {
+  for (var i = 0; i < this.globals.length; i++) {
+    window[this.globals[i]] = undefined;
+  }
+
+  window.onerror = onerror;
+  window.onload = onload;
+};
+
+/**
+ * Load a tag by `name`.
+ *
+ * @param {string} name The name of the tag.
+ * @param {Object} locals Locals used to populate the tag's template variables
+ * (e.g. `userId` in '<img src="https://whatever.com/{{ userId }}">').
+ * @param {Function} [callback=noop] A callback, invoked when the tag finishes
+ * loading.
+ */
+
+exports.load = function(name, locals, callback) {
+  // Argument shuffling
+  if (typeof name === 'function') { callback = name; locals = null; name = null; }
+  if (name && typeof name === 'object') { callback = locals; locals = name; name = null; }
+  if (typeof locals === 'function') { callback = locals; locals = null; }
+
+  // Default arguments
+  name = name || 'library';
+  locals = locals || {};
+
+  locals = this.locals(locals);
+  var template = this.templates[name];
+  if (!template) throw new Error(fmt('template "%s" not defined.', name));
+  var attrs = render(template, locals);
+  callback = callback || noop;
+  var self = this;
+  var el;
+
+  switch (template.type) {
+  case 'img':
+    attrs.width = 1;
+    attrs.height = 1;
+    el = loadImage(attrs, callback);
+    break;
+  case 'script':
+    el = loadScript(attrs, function(err) {
+      if (!err) return callback();
+      self.debug('error loading "%s" error="%s"', self.name, err);
+    });
+      // TODO: hack until refactoring load-script
+    delete attrs.src;
+    each(function(val, key) {
+      el.setAttribute(key, val);
+    }, attrs);
+    break;
+  case 'iframe':
+    el = loadIframe(attrs, callback);
+    break;
+  default:
+      // No default case
+  }
+
+  return el;
+};
+
+/**
+ * Locals for tag templates.
+ *
+ * By default it includes a cache buster and all of the options.
+ *
+ * @param {Object} [locals]
+ * @return {Object}
+ */
+
+exports.locals = function(locals) {
+  locals = locals || {};
+  var cache = Math.floor(new Date().getTime() / 3600000);
+  if (!locals.hasOwnProperty('cache')) locals.cache = cache;
+  each(function(val, key) {
+    if (!locals.hasOwnProperty(key)) locals[key] = val;
+  }, this.options);
+  return locals;
+};
+
+/**
+ * Simple way to emit ready.
+ *
+ * @api public
+ */
+
+exports.ready = function() {
+  this.emit('ready');
+};
+
+/**
+ * Wrap the initialize method in an exists check, so we don't have to do it for
+ * every single integration.
+ *
+ * @api private
+ */
+
+exports._wrapInitialize = function() {
+  var initialize = this.initialize;
+  this.initialize = function() {
+    this.debug('initialize');
+    this._initialized = true;
+    var ret = initialize.apply(this, arguments);
+    this.emit('initialize');
+    return ret;
+  };
+};
+
+/**
+ * Wrap the page method to call to noop the first page call if the integration assumes
+ * a pageview.
+ *
+ * @api private
+ */
+
+exports._wrapPage = function() {
+  var page = this.page;
+  var initialPageSkipped = false;
+  this.page = function() {
+    if (this._assumesPageview && !initialPageSkipped) {
+      initialPageSkipped = true;
+      return;
+    }
+    return page.apply(this, arguments);
+  };
+};
+
+/**
+ * Wrap the track method to call other ecommerce methods if available depending
+ * on the `track.event()`.
+ *
+ * @api private
+ */
+
+exports._wrapTrack = function() {
+  var t = this.track;
+  this.track = function(track) {
+    var event = track.event();
+    var called;
+    var ret;
+
+    for (var method in events) {
+      if (has.call(events, method)) {
+        var regexp = events[method];
+        if (!this[method]) continue;
+        if (!regexp.test(event)) continue;
+        ret = this[method].apply(this, arguments);
+        called = true;
+        break;
+      }
+    }
+
+    if (!called) ret = t.apply(this, arguments);
+    return ret;
+  };
+};
+
+/**
+ * Determine the type of the option passed to `#map`
+ *
+ * @api private
+ * @param {Object|Object[]} mapping
+ * @return {String} mappingType
+ */
+
+function getMappingType(mapping) {
+  if (is.array(mapping)) {
+    return every(isMixed, mapping) ? 'mixed' : 'array';
+  }
+  if (is.object(mapping)) return 'map';
+  return 'unknown';
+}
+
+/**
+ * Determine if item in mapping array is a valid "mixed" type value
+ *
+ * Must be an object with properties "key" (of type string)
+ * and "value" (of any type)
+ *
+ * @api private
+ * @param {*} item
+ * @return {Boolean}
+ */
+
+function isMixed(item) {
+  if (!is.object(item)) return false;
+  if (!is.string(item.key)) return false;
+  if (!has.call(item, 'value')) return false;
+  return true;
+}
+
+/**
+ * TODO: Document me
+ *
+ * @api private
+ * @param {Object} attrs
+ * @param {Function} fn
+ * @return {Image}
+ */
+
+function loadImage(attrs, fn) {
+  fn = fn || function() {};
+  var img = new Image();
+  img.onerror = error(fn, 'failed to load pixel', img);
+  img.onload = function() { fn(); };
+  img.src = attrs.src;
+  img.width = 1;
+  img.height = 1;
+  return img;
+}
+
+/**
+ * TODO: Document me
+ *
+ * @api private
+ * @param {Function} fn
+ * @param {string} message
+ * @param {Element} img
+ * @return {Function}
+ */
+
+function error(fn, message, img) {
+  return function(e) {
+    e = e || window.event;
+    var err = new Error(message);
+    err.event = e;
+    err.source = img;
+    fn(err);
+  };
+}
+
+/**
+ * Render template + locals into an `attrs` object.
+ *
+ * @api private
+ * @param {Object} template
+ * @param {Object} locals
+ * @return {Object}
+ */
+
+function render(template, locals) {
+  return foldl(function(attrs, val, key) {
+    attrs[key] = val.replace(/\{\{\ *(\w+)\ *\}\}/g, function(_, $1) {
+      return locals[$1];
+    });
+    return attrs;
+  }, {}, template.attrs);
+}
+
+},{"@ndhoule/each":8,"@ndhoule/every":9,"@ndhoule/foldl":11,"@segment/fmt":48,"@segment/load-script":52,"analytics-events":68,"component-emitter":78,"is":94,"load-iframe":99,"next-tick":105,"to-no-case":127}],42:[function(require,module,exports){
+'use strict';
+
+/**
+ * Module dependencies.
+ */
+
+var Emitter = require('component-emitter');
+var domify = require('domify');
+var each = require('@ndhoule/each');
+var includes = require('@ndhoule/includes');
+
+/**
+ * Mix in emitter.
+ */
+
+/* eslint-disable new-cap */
+Emitter(exports);
+/* eslint-enable new-cap */
+
+/**
+ * Add a new option to the integration by `key` with default `value`.
+ *
+ * @api public
+ * @param {string} key
+ * @param {*} value
+ * @return {Integration}
+ */
+
+exports.option = function(key, value) {
+  this.prototype.defaults[key] = value;
+  return this;
+};
+
+/**
+ * Add a new mapping option.
+ *
+ * This will create a method `name` that will return a mapping for you to use.
+ *
+ * @api public
+ * @param {string} name
+ * @return {Integration}
+ * @example
+ * Integration('My Integration')
+ *   .mapping('events');
+ *
+ * new MyIntegration().track('My Event');
+ *
+ * .track = function(track){
+ *   var events = this.events(track.event());
+ *   each(send, events);
+ *  };
+ */
+
+exports.mapping = function(name) {
+  this.option(name, []);
+  this.prototype[name] = function(key) {
+    return this.map(this.options[name], key);
+  };
+  return this;
+};
+
+/**
+ * Register a new global variable `key` owned by the integration, which will be
+ * used to test whether the integration is already on the page.
+ *
+ * @api public
+ * @param {string} key
+ * @return {Integration}
+ */
+
+exports.global = function(key) {
+  this.prototype.globals.push(key);
+  return this;
+};
+
+/**
+ * Mark the integration as assuming an initial pageview, so to defer the first page call, keep track of
+ * whether we already nooped the first page call.
+ *
+ * @api public
+ * @return {Integration}
+ */
+
+exports.assumesPageview = function() {
+  this.prototype._assumesPageview = true;
+  return this;
+};
+
+/**
+ * Mark the integration as being "ready" once `load` is called.
+ *
+ * @api public
+ * @return {Integration}
+ */
+
+exports.readyOnLoad = function() {
+  this.prototype._readyOnLoad = true;
+  return this;
+};
+
+/**
+ * Mark the integration as being "ready" once `initialize` is called.
+ *
+ * @api public
+ * @return {Integration}
+ */
+
+exports.readyOnInitialize = function() {
+  this.prototype._readyOnInitialize = true;
+  return this;
+};
+
+/**
+ * Define a tag to be loaded.
+ *
+ * @api public
+ * @param {string} [name='library'] A nicename for the tag, commonly used in
+ * #load. Helpful when the integration has multiple tags and you need a way to
+ * specify which of the tags you want to load at a given time.
+ * @param {String} str DOM tag as string or URL.
+ * @return {Integration}
+ */
+
+exports.tag = function(name, tag) {
+  if (tag == null) {
+    tag = name;
+    name = 'library';
+  }
+  this.prototype.templates[name] = objectify(tag);
+  return this;
+};
+
+/**
+ * Given a string, give back DOM attributes.
+ *
+ * Do it in a way where the browser doesn't load images or iframes. It turns
+ * out domify will load images/iframes because whenever you construct those
+ * DOM elements, the browser immediately loads them.
+ *
+ * @api private
+ * @param {string} str
+ * @return {Object}
+ */
+
+function objectify(str) {
+  // replace `src` with `data-src` to prevent image loading
+  str = str.replace(' src="', ' data-src="');
+
+  var el = domify(str);
+  var attrs = {};
+
+  each(function(attr) {
+    // then replace it back
+    var name = attr.name === 'data-src' ? 'src' : attr.name;
+    if (!includes(attr.name + '=', str)) return;
+    attrs[name] = attr.value;
+  }, el.attributes);
+
+  return {
+    type: el.tagName.toLowerCase(),
+    attrs: attrs
+  };
+}
+
+},{"@ndhoule/each":8,"@ndhoule/includes":12,"component-emitter":78,"domify":86}],43:[function(require,module,exports){
+arguments[4][38][0].apply(exports,arguments)
+},{"./debug":44,"_process":108,"dup":38}],44:[function(require,module,exports){
+arguments[4][39][0].apply(exports,arguments)
+},{"dup":39,"ms":100}],45:[function(require,module,exports){
+'use strict';
+
+var hasOwn = Object.prototype.hasOwnProperty;
+var toStr = Object.prototype.toString;
+
+var isArray = function isArray(arr) {
+	if (typeof Array.isArray === 'function') {
+		return Array.isArray(arr);
+	}
+
+	return toStr.call(arr) === '[object Array]';
+};
+
+var isPlainObject = function isPlainObject(obj) {
+	if (!obj || toStr.call(obj) !== '[object Object]') {
+		return false;
+	}
+
+	var hasOwnConstructor = hasOwn.call(obj, 'constructor');
+	var hasIsPrototypeOf = obj.constructor && obj.constructor.prototype && hasOwn.call(obj.constructor.prototype, 'isPrototypeOf');
+	// Not own constructor property must be Object
+	if (obj.constructor && !hasOwnConstructor && !hasIsPrototypeOf) {
+		return false;
+	}
+
+	// Own properties are enumerated firstly, so to speed up,
+	// if last one is own, then all properties are own.
+	var key;
+	for (key in obj) { /**/ }
+
+	return typeof key === 'undefined' || hasOwn.call(obj, key);
+};
+
+module.exports = function extend() {
+	var options, name, src, copy, copyIsArray, clone;
+	var target = arguments[0];
+	var i = 1;
+	var length = arguments.length;
+	var deep = false;
+
+	// Handle a deep copy situation
+	if (typeof target === 'boolean') {
+		deep = target;
+		target = arguments[1] || {};
+		// skip the boolean and the target
+		i = 2;
+	}
+	if (target == null || (typeof target !== 'object' && typeof target !== 'function')) {
+		target = {};
+	}
+
+	for (; i < length; ++i) {
+		options = arguments[i];
+		// Only deal with non-null/undefined values
+		if (options != null) {
+			// Extend the base object
+			for (name in options) {
+				src = target[name];
+				copy = options[name];
+
+				// Prevent never-ending loop
+				if (target !== copy) {
+					// Recurse if we're merging plain objects or arrays
+					if (deep && copy && (isPlainObject(copy) || (copyIsArray = isArray(copy)))) {
+						if (copyIsArray) {
+							copyIsArray = false;
+							clone = src && isArray(src) ? src : [];
+						} else {
+							clone = src && isPlainObject(src) ? src : {};
+						}
+
+						// Never move original objects, clone them
+						target[name] = extend(deep, clone, copy);
+
+					// Don't bring in undefined values
+					} else if (typeof copy !== 'undefined') {
+						target[name] = copy;
+					}
+				}
+			}
+		}
+	}
+
+	// Return the modified object
+	return target;
+};
+
+},{}],46:[function(require,module,exports){
 var utf8Encode = require('utf8-encode');
 var keyStr = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
 
@@ -5082,7 +7657,7 @@ function encode(input) {
 
     return output;
 }
-},{"utf8-encode":115}],38:[function(require,module,exports){
+},{"utf8-encode":131}],47:[function(require,module,exports){
 'use strict';
 
 /**
@@ -5106,7 +7681,7 @@ function canonical() {
 
 module.exports = canonical;
 
-},{}],39:[function(require,module,exports){
+},{}],48:[function(require,module,exports){
 (function (global){
 'use strict';
 
@@ -5141,7 +7716,7 @@ fmt.d = parseInt;
 module.exports = fmt;
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],40:[function(require,module,exports){
+},{}],49:[function(require,module,exports){
 'use strict';
 
 function isMeta(e) {
@@ -5169,7 +7744,7 @@ function isMeta(e) {
 
 module.exports = isMeta;
 
-},{}],41:[function(require,module,exports){
+},{}],50:[function(require,module,exports){
 'use strict';
 
 var type = require('component-type');
@@ -5246,7 +7821,7 @@ function array(arr, strict) {
   return arr;
 }
 
-},{"@segment/isodate":42,"component-each":66,"component-type":73}],42:[function(require,module,exports){
+},{"@segment/isodate":51,"component-each":76,"component-type":83}],51:[function(require,module,exports){
 'use strict';
 
 /**
@@ -5327,7 +7902,7 @@ exports.is = function(string, strict) {
   return matcher.test(string);
 };
 
-},{}],43:[function(require,module,exports){
+},{}],52:[function(require,module,exports){
 'use strict';
 
 /*
@@ -5399,7 +7974,7 @@ function loadScript(options, cb) {
 
 module.exports = loadScript;
 
-},{"component-type":73,"next-tick":92,"script-onload":95}],44:[function(require,module,exports){
+},{"component-type":83,"next-tick":105,"script-onload":110}],53:[function(require,module,exports){
 'use strict';
 
 var keys = require('@ndhoule/keys');
@@ -5464,7 +8039,7 @@ module.exports.defaultEngine = pickStorage();
 // Expose the in-memory store explicitly for testing
 module.exports.inMemoryEngine = inMemoryStore;
 
-},{"@ndhoule/keys":13,"uuid":48}],45:[function(require,module,exports){
+},{"@ndhoule/keys":13,"uuid":57}],54:[function(require,module,exports){
 'use strict';
 
 var uuid = require('uuid').v4;
@@ -5814,7 +8389,7 @@ Queue.prototype._reclaim = function(id) {
 
 module.exports = Queue;
 
-},{"./schedule":46,"./store":47,"@ndhoule/each":8,"component-emitter":68,"debug":75,"uuid":48}],46:[function(require,module,exports){
+},{"./schedule":55,"./store":56,"@ndhoule/each":8,"component-emitter":78,"debug":85,"uuid":57}],55:[function(require,module,exports){
 'use strict';
 
 var each = require('@ndhoule/each');
@@ -5876,7 +8451,7 @@ Schedule.resetClock = function() {
 
 module.exports = Schedule;
 
-},{"@ndhoule/each":8}],47:[function(require,module,exports){
+},{"@ndhoule/each":8}],56:[function(require,module,exports){
 'use strict';
 
 var defaultEngine = require('./engine').defaultEngine;
@@ -6003,7 +8578,7 @@ function isQuotaExceeded(e) {
   return quotaExceeded;
 }
 
-},{"./engine":44,"@ndhoule/each":8,"@ndhoule/keys":13,"json3":82}],48:[function(require,module,exports){
+},{"./engine":53,"@ndhoule/each":8,"@ndhoule/keys":13,"json3":95}],57:[function(require,module,exports){
 var v1 = require('./v1');
 var v4 = require('./v4');
 
@@ -6013,7 +8588,7 @@ uuid.v4 = v4;
 
 module.exports = uuid;
 
-},{"./v1":51,"./v4":52}],49:[function(require,module,exports){
+},{"./v1":60,"./v4":61}],58:[function(require,module,exports){
 /**
  * Convert array of 16 byte values to UUID string format of the form:
  * XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
@@ -6027,19 +8602,21 @@ function bytesToUuid(buf, offset) {
   var i = offset || 0;
   var bth = byteToHex;
   // join used to fix memory issue caused by concatenation: https://bugs.chromium.org/p/v8/issues/detail?id=3175#c4
-  return ([bth[buf[i++]], bth[buf[i++]], 
-	bth[buf[i++]], bth[buf[i++]], '-',
-	bth[buf[i++]], bth[buf[i++]], '-',
-	bth[buf[i++]], bth[buf[i++]], '-',
-	bth[buf[i++]], bth[buf[i++]], '-',
-	bth[buf[i++]], bth[buf[i++]],
-	bth[buf[i++]], bth[buf[i++]],
-	bth[buf[i++]], bth[buf[i++]]]).join('');
+  return ([
+    bth[buf[i++]], bth[buf[i++]],
+    bth[buf[i++]], bth[buf[i++]], '-',
+    bth[buf[i++]], bth[buf[i++]], '-',
+    bth[buf[i++]], bth[buf[i++]], '-',
+    bth[buf[i++]], bth[buf[i++]], '-',
+    bth[buf[i++]], bth[buf[i++]],
+    bth[buf[i++]], bth[buf[i++]],
+    bth[buf[i++]], bth[buf[i++]]
+  ]).join('');
 }
 
 module.exports = bytesToUuid;
 
-},{}],50:[function(require,module,exports){
+},{}],59:[function(require,module,exports){
 // Unique ID creation requires a high quality random # generator.  In the
 // browser this is a little complicated due to unknown quality of Math.random()
 // and inconsistent support for the `crypto` API.  We do the best we can via
@@ -6075,7 +8652,7 @@ if (getRandomValues) {
   };
 }
 
-},{}],51:[function(require,module,exports){
+},{}],60:[function(require,module,exports){
 var rng = require('./lib/rng');
 var bytesToUuid = require('./lib/bytesToUuid');
 
@@ -6091,7 +8668,7 @@ var _clockseq;
 var _lastMSecs = 0;
 var _lastNSecs = 0;
 
-// See https://github.com/broofa/node-uuid for API details
+// See https://github.com/uuidjs/uuid for API details
 function v1(options, buf, offset) {
   var i = buf && offset || 0;
   var b = buf || [];
@@ -6186,7 +8763,7 @@ function v1(options, buf, offset) {
 
 module.exports = v1;
 
-},{"./lib/bytesToUuid":49,"./lib/rng":50}],52:[function(require,module,exports){
+},{"./lib/bytesToUuid":58,"./lib/rng":59}],61:[function(require,module,exports){
 var rng = require('./lib/rng');
 var bytesToUuid = require('./lib/bytesToUuid');
 
@@ -6217,7 +8794,7 @@ function v4(options, buf, offset) {
 
 module.exports = v4;
 
-},{"./lib/bytesToUuid":49,"./lib/rng":50}],53:[function(require,module,exports){
+},{"./lib/bytesToUuid":58,"./lib/rng":59}],62:[function(require,module,exports){
 'use strict';
 
 /**
@@ -6242,7 +8819,7 @@ function preventDefault(e) {
 
 module.exports = preventDefault;
 
-},{}],54:[function(require,module,exports){
+},{}],63:[function(require,module,exports){
 'use strict';
 
 /**
@@ -6327,7 +8904,7 @@ function set(protocol) {
   }
 }
 
-},{}],55:[function(require,module,exports){
+},{}],64:[function(require,module,exports){
 'use strict';
 
 /*
@@ -6445,7 +9022,7 @@ function encode(obj) {
   return encodeURIComponent(str);
 }
 
-},{"@segment/base64-encode":37,"has-cors":78,"json3":82,"jsonp":83}],56:[function(require,module,exports){
+},{"@segment/base64-encode":46,"has-cors":91,"json3":95,"jsonp":96}],65:[function(require,module,exports){
 (function (global){
 "use strict"
 
@@ -6618,7 +9195,7 @@ module.exports = (function() {
 }())
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"json3":82}],57:[function(require,module,exports){
+},{"json3":95}],66:[function(require,module,exports){
 'use strict';
 
 /**
@@ -6718,7 +9295,7 @@ domain.cookie = cookie;
 
 exports = module.exports = domain;
 
-},{"component-cookie":62,"component-url":74}],58:[function(require,module,exports){
+},{"component-cookie":72,"component-url":84}],67:[function(require,module,exports){
 'use strict';
 
 /**
@@ -6797,7 +9374,329 @@ function strict(query) {
 module.exports = utm;
 module.exports.strict = strict;
 
-},{"@ndhoule/foldl":11,"component-querystring":71}],59:[function(require,module,exports){
+},{"@ndhoule/foldl":11,"component-querystring":81}],68:[function(require,module,exports){
+'use strict';
+
+/**
+ * Module Dependencies
+ */
+
+var map = require('@ndhoule/map');
+var foldl = require('@ndhoule/foldl');
+
+var eventMap = {
+  // Videos
+  videoPlaybackStarted: [{
+    object: 'video playback',
+    action: 'started'
+  }],
+  videoPlaybackPaused: [{
+    object: 'video playback',
+    action: 'paused'
+  }],
+  videoPlaybackInterrupted: [{
+    object: 'video playback',
+    action: 'interrupted'
+  }],
+  videoPlaybackResumed: [{
+    object: 'video playback',
+    action: 'resumed'
+  }],
+  videoPlaybackCompleted: [{
+    object: 'video playback',
+    action: 'completed'
+  }],
+  videoPlaybackBufferStarted: [{
+    object: 'video playback buffer',
+    action: 'started'
+  }],
+  videoPlaybackBufferCompleted: [{
+    object: 'video playback buffer',
+    action: 'completed'
+  }],
+  videoPlaybackSeekStarted: [{
+    object: 'video playback seek',
+    action: 'started'
+  }],
+  videoPlaybackSeekCompleted: [{
+    object: 'video playback seek',
+    action: 'completed'
+  }],
+  videoContentStarted: [{
+    object: 'video content',
+    action: 'started'
+  }],
+  videoContentPlaying: [{
+    object: 'video content',
+    action: 'playing'
+  }],
+  videoContentCompleted: [{
+    object: 'video content',
+    action: 'completed'
+  }],
+  videoAdStarted: [{
+    object: 'video ad',
+    action: 'started'
+  }],
+  videoAdPlaying: [{
+    object: 'video ad',
+    action: 'playing'
+  }],
+  videoAdCompleted: [{
+    object: 'video ad',
+    action: 'completed'
+  }],
+
+  // Promotions
+  promotionViewed: [{
+    object: 'promotion',
+    action: 'viewed'
+  }],
+  promotionClicked: [{
+    object: 'promotion',
+    action: 'clicked'
+  }],
+
+  // Browsing
+  productsSearched: [{
+    object: 'products',
+    action: 'searched'
+  }],
+  productListViewed: [{
+    object: 'product list',
+    action: 'viewed'
+  }, {
+    object: 'product category',
+    action: 'viewed'
+  }],
+  productListFiltered: [{
+    object: 'product list',
+    action: 'filtered'
+  }],
+
+  // Core Ordering
+  productClicked: [{
+    object: 'product',
+    action: 'clicked'
+  }],
+  productViewed: [{
+    object: 'product',
+    action: 'viewed'
+  }],
+  productAdded: [{
+    object: 'product',
+    action: 'added'
+  }],
+  productRemoved: [{
+    object: 'product',
+    action: 'removed'
+  }],
+  cartViewed: [{
+    object: 'cart',
+    action: 'viewed'
+  }],
+  orderUpdated: [{
+    object: 'order',
+    action: 'updated'
+  }],
+  orderCompleted: [{
+    object: 'order',
+    action: 'completed'
+  }],
+  orderRefunded: [{
+    object: 'order',
+    action: 'refunded'
+  }],
+  orderCancelled: [{
+    object: 'order',
+    action: 'cancelled'
+  }],
+  paymentInfoEntered: [{
+    object: 'payment info',
+    action: 'entered'
+  }],
+  checkoutStarted: [{
+    object: 'checkout',
+    action: 'started'
+  }],
+  checkoutStepViewed: [{
+    object: 'checkout step',
+    action: 'viewed'
+  }],
+  checkoutStepCompleted: [{
+    object: 'checkout step',
+    action: 'completed'
+  }],
+
+  // Coupons
+  couponEntered: [{
+    object: 'coupon',
+    action: 'entered'
+  }],
+  couponApplied: [{
+    object: 'coupon',
+    action: 'applied'
+  }],
+  couponDenied: [{
+    object: 'coupon',
+    action: 'denied'
+  }],
+  couponRemoved: [{
+    object: 'coupon',
+    action: 'removed'
+  }],
+
+  // Wishlisting
+  productAddedToWishlist: [{
+    object: 'product',
+    action: 'added to wishlist'
+  }],
+  productRemovedFromWishlist: [{
+    object: 'product',
+    action: 'removed from wishlist'
+  }],
+  productAddedFromWishlistToCart: [{
+    object: 'product',
+    action: 'added to cart from wishlist'
+  }, {
+    object: 'product',
+    action: 'added from wishlist to cart'
+  }],
+
+  // Sharing
+  productShared: [{
+    object: 'product',
+    action: 'shared'
+  }],
+  cartShared: [{
+    object: 'cart',
+    action: 'shared'
+  }],
+
+  // Reviewing
+  productReviewed: [{
+    object: 'product',
+    action: 'reviewed'
+  }],
+
+  // App Lifecycle
+  applicationInstalled: [{
+    object: 'application',
+    action: 'installed'
+  }],
+  applicationUpdated: [{
+    object: 'application',
+    action: 'updated'
+  }],
+  applicationOpened: [{
+    object: 'application',
+    action: 'opened'
+  }],
+  applicationBackgrounded: [{
+    object: 'application',
+    action: 'backgrounded'
+  }],
+  applicationUninstalled: [{
+    object: 'application',
+    action: 'uninstalled'
+  }],
+  applicationCrashed: [{
+    object: 'application',
+    action: 'crashed'
+  }],
+
+  // App Campaign and Referral Events
+  installAttributed: [{
+    object: 'install',
+    action: 'attributed'
+  }],
+  deepLinkOpened: [{
+    object: 'deep link',
+    action: 'opened'
+  }],
+  pushNotificationReceived: [{
+    object: 'push notification',
+    action: 'received'
+  }],
+  pushNotificationTapped: [{
+    object: 'push notification',
+    action: 'tapped'
+  }],
+  pushNotificationBounced: [{
+    object: 'push notification',
+    action: 'bounced'
+  }],
+
+  // Email
+  emailBounced: [{
+    object: 'email',
+    action: 'bounced'
+  }],
+  emailDelivered: [{
+    object: 'email',
+    action: 'delivered'
+  }],
+  emailLinkClicked: [{
+    object: 'email link',
+    action: 'clicked'
+  }],
+  emailMarkedAsSpam: [{
+    object: 'email',
+    action: 'marked as spam'
+  }],
+  emailOpened: [{
+    object: 'email',
+    action: 'opened'
+  }],
+  unsubscribed: [{
+    object: '',
+    action: 'unsubscribed'
+  }]
+};
+
+/**
+ * Export the event map
+ *
+ * For each method
+ *   - For each of its object:action alias pairs
+ *     - For each permutation of that pair
+ *       - Create a regex string
+ *   - Join them and assign it to its respective method value
+ *
+ *  [{
+ *    object: 'product list',
+ *    action: 'viewed'
+ *  },{
+ *    object: 'product category',
+ *    action: 'viewed'
+ *  }] => /
+ *    ^[ _]?product[ _]?list[ _]?viewed[ _]?
+ *   |^[ _]?viewed[ _]?product[ _]?list[ _]?
+ *   |^[ _]?product[ _]?category[ _]?viewed[ _]?
+ *   |^[ _]?viewed[ _]?product[ _]?category[ _]?
+ *   $/i
+ *
+ *  todo(cs/wj/nh): memoization strategy / build step?
+ */
+
+module.exports = foldl(function transform(ret, pairs, method) {
+  var values = map(function(pair) {
+    return map(function(permutation) {
+      var flattened = [].concat.apply([], map(function(words) {
+        return words.split(' ');
+      }, permutation));
+      return '^[ _]?' + flattened.join('[ _]?') + '[ _]?';
+    }, [
+      [pair.action, pair.object],
+      [pair.object, pair.action]
+    ]).join('|');
+  }, pairs);
+  var conjoined = values.join('|') + '$';
+  ret[method] = new RegExp(conjoined, 'i');
+  return ret;
+}, {}, eventMap);
+
+},{"@ndhoule/foldl":11,"@ndhoule/map":14}],69:[function(require,module,exports){
 'use strict';
 
 var bind = require('component-bind');
@@ -6815,7 +9714,7 @@ function bindAll(obj) {
 
 module.exports = bindAll;
 
-},{"component-bind":60}],60:[function(require,module,exports){
+},{"component-bind":70}],70:[function(require,module,exports){
 /**
  * Slice reference.
  */
@@ -6840,7 +9739,7 @@ module.exports = function(obj, fn){
   }
 };
 
-},{}],61:[function(require,module,exports){
+},{}],71:[function(require,module,exports){
 /**
  * Module dependencies.
  */
@@ -6899,7 +9798,7 @@ function clone(obj){
   }
 }
 
-},{"component-type":73,"type":73}],62:[function(require,module,exports){
+},{"component-type":83,"type":83}],72:[function(require,module,exports){
 
 /**
  * Module dependencies.
@@ -7032,7 +9931,7 @@ function decode(value) {
   }
 }
 
-},{"debug":63}],63:[function(require,module,exports){
+},{"debug":73}],73:[function(require,module,exports){
 
 /**
  * This is the web browser implementation of `debug()`.
@@ -7202,7 +10101,7 @@ function localstorage(){
   } catch (e) {}
 }
 
-},{"./debug":64}],64:[function(require,module,exports){
+},{"./debug":74}],74:[function(require,module,exports){
 
 /**
  * This is the common logic for both the Node.js and web browser
@@ -7401,7 +10300,7 @@ function coerce(val) {
   return val;
 }
 
-},{"ms":65}],65:[function(require,module,exports){
+},{"ms":75}],75:[function(require,module,exports){
 /**
  * Helpers.
  */
@@ -7528,7 +10427,7 @@ function plural(ms, n, name) {
   return Math.ceil(ms / n) + ' ' + name + 's';
 }
 
-},{}],66:[function(require,module,exports){
+},{}],76:[function(require,module,exports){
 
 /**
  * Module dependencies.
@@ -7619,7 +10518,7 @@ function array(obj, fn, ctx) {
   }
 }
 
-},{"component-type":67,"to-function":111,"type":67}],67:[function(require,module,exports){
+},{"component-type":77,"to-function":126,"type":77}],77:[function(require,module,exports){
 
 /**
  * toString ref.
@@ -7653,7 +10552,7 @@ module.exports = function(val){
   return typeof val;
 };
 
-},{}],68:[function(require,module,exports){
+},{}],78:[function(require,module,exports){
 
 /**
  * Expose `Emitter`.
@@ -7767,6 +10666,13 @@ Emitter.prototype.removeEventListener = function(event, fn){
       break;
     }
   }
+
+  // Remove event specific arrays for event types that no
+  // one is subscribed for to avoid memory leak.
+  if (callbacks.length === 0) {
+    delete this._callbacks['$' + event];
+  }
+
   return this;
 };
 
@@ -7780,8 +10686,13 @@ Emitter.prototype.removeEventListener = function(event, fn){
 
 Emitter.prototype.emit = function(event){
   this._callbacks = this._callbacks || {};
-  var args = [].slice.call(arguments, 1)
+
+  var args = new Array(arguments.length - 1)
     , callbacks = this._callbacks['$' + event];
+
+  for (var i = 1; i < arguments.length; i++) {
+    args[i - 1] = arguments[i];
+  }
 
   if (callbacks) {
     callbacks = callbacks.slice(0);
@@ -7818,7 +10729,7 @@ Emitter.prototype.hasListeners = function(event){
   return !! this.listeners(event).length;
 };
 
-},{}],69:[function(require,module,exports){
+},{}],79:[function(require,module,exports){
 var bind = window.addEventListener ? 'addEventListener' : 'attachEvent',
     unbind = window.removeEventListener ? 'removeEventListener' : 'detachEvent',
     prefix = bind !== 'addEventListener' ? 'on' : '';
@@ -7854,7 +10765,7 @@ exports.unbind = function(el, type, fn, capture){
   el[unbind](prefix + type, fn, capture || false);
   return fn;
 };
-},{}],70:[function(require,module,exports){
+},{}],80:[function(require,module,exports){
 /**
  * Global Names
  */
@@ -7941,7 +10852,7 @@ function prefixed(str) {
   };
 }
 
-},{}],71:[function(require,module,exports){
+},{}],81:[function(require,module,exports){
 
 /**
  * Module dependencies.
@@ -8048,7 +10959,7 @@ exports.stringify = function(obj){
   return pairs.join('&');
 };
 
-},{"trim":113,"type":72}],72:[function(require,module,exports){
+},{"trim":128,"type":82}],82:[function(require,module,exports){
 /**
  * toString ref.
  */
@@ -8084,7 +10995,7 @@ module.exports = function(val){
   return typeof val;
 };
 
-},{}],73:[function(require,module,exports){
+},{}],83:[function(require,module,exports){
 /**
  * toString ref.
  */
@@ -8132,7 +11043,7 @@ function isBuffer(obj) {
     ))
 }
 
-},{}],74:[function(require,module,exports){
+},{}],84:[function(require,module,exports){
 
 /**
  * Parse the given `url`.
@@ -8216,7 +11127,7 @@ function port (protocol){
   }
 }
 
-},{}],75:[function(require,module,exports){
+},{}],85:[function(require,module,exports){
 
 /**
  * Expose `debug()` as the module.
@@ -8355,7 +11266,7 @@ try {
   if (window.localStorage) debug.enable(localStorage.debug);
 } catch(e){}
 
-},{}],76:[function(require,module,exports){
+},{}],86:[function(require,module,exports){
 
 /**
  * Expose `parse`.
@@ -8469,11 +11380,13 @@ function parse(html, doc) {
   return fragment;
 }
 
-},{}],77:[function(require,module,exports){
+},{}],87:[function(require,module,exports){
 'use strict';
 
 var hasOwn = Object.prototype.hasOwnProperty;
 var toStr = Object.prototype.toString;
+var defineProperty = Object.defineProperty;
+var gOPD = Object.getOwnPropertyDescriptor;
 
 var isArray = function isArray(arr) {
 	if (typeof Array.isArray === 'function') {
@@ -8503,6 +11416,35 @@ var isPlainObject = function isPlainObject(obj) {
 	return typeof key === 'undefined' || hasOwn.call(obj, key);
 };
 
+// If name is '__proto__', and Object.defineProperty is available, define __proto__ as an own property on target
+var setProperty = function setProperty(target, options) {
+	if (defineProperty && options.name === '__proto__') {
+		defineProperty(target, options.name, {
+			enumerable: true,
+			configurable: true,
+			value: options.newValue,
+			writable: true
+		});
+	} else {
+		target[options.name] = options.newValue;
+	}
+};
+
+// Return undefined instead of __proto__ if '__proto__' is not an own property
+var getProperty = function getProperty(obj, name) {
+	if (name === '__proto__') {
+		if (!hasOwn.call(obj, name)) {
+			return void 0;
+		} else if (gOPD) {
+			// In early versions of node, obj['__proto__'] is buggy when obj has
+			// __proto__ as an own property. Object.getOwnPropertyDescriptor() works.
+			return gOPD(obj, name).value;
+		}
+	}
+
+	return obj[name];
+};
+
 module.exports = function extend() {
 	var options, name, src, copy, copyIsArray, clone;
 	var target = arguments[0];
@@ -8527,8 +11469,8 @@ module.exports = function extend() {
 		if (options != null) {
 			// Extend the base object
 			for (name in options) {
-				src = target[name];
-				copy = options[name];
+				src = getProperty(target, name);
+				copy = getProperty(options, name);
 
 				// Prevent never-ending loop
 				if (target !== copy) {
@@ -8542,11 +11484,11 @@ module.exports = function extend() {
 						}
 
 						// Never move original objects, clone them
-						target[name] = extend(deep, clone, copy);
+						setProperty(target, { name: name, newValue: extend(deep, clone, copy) });
 
 					// Don't bring in undefined values
 					} else if (typeof copy !== 'undefined') {
-						target[name] = copy;
+						setProperty(target, { name: name, newValue: copy });
 					}
 				}
 			}
@@ -8557,7 +11499,48 @@ module.exports = function extend() {
 	return target;
 };
 
-},{}],78:[function(require,module,exports){
+},{}],88:[function(require,module,exports){
+
+/**
+ * Module dependencies.
+ */
+
+var debug = require('debug');
+
+/**
+ * Expose `generate`.
+ */
+
+module.exports = generate;
+
+/**
+ * Generate a global queue pushing method with `name`.
+ *
+ * @param {String} name
+ * @param {Object} options
+ *   @property {Boolean} wrap
+ * @return {Function}
+ */
+
+function generate (name, options) {
+  var log = debug('global-queue:' + name);
+  options = options || {};
+
+  return function (args) {
+    args = [].slice.call(arguments);
+    window[name] || (window[name] = []);
+    log('%o', args);
+    options.wrap === false
+      ? window[name].push.apply(window[name], args)
+      : window[name].push(args);
+  };
+}
+
+},{"debug":89}],89:[function(require,module,exports){
+arguments[4][38][0].apply(exports,arguments)
+},{"./debug":90,"_process":108,"dup":38}],90:[function(require,module,exports){
+arguments[4][39][0].apply(exports,arguments)
+},{"dup":39,"ms":100}],91:[function(require,module,exports){
 
 /**
  * Module exports.
@@ -8576,7 +11559,7 @@ try {
   module.exports = false;
 }
 
-},{}],79:[function(require,module,exports){
+},{}],92:[function(require,module,exports){
 if (typeof Object.create === 'function') {
   // implementation from standard node.js 'util' module
   module.exports = function inherits(ctor, superCtor) {
@@ -8601,12 +11584,12 @@ if (typeof Object.create === 'function') {
   }
 }
 
-},{}],80:[function(require,module,exports){
+},{}],93:[function(require,module,exports){
 
 module.exports = function isEmail (string) {
     return (/.+\@.+\..+/).test(string);
 };
-},{}],81:[function(require,module,exports){
+},{}],94:[function(require,module,exports){
 /* globals window, HTMLElement */
 
 'use strict';
@@ -8625,6 +11608,10 @@ var toStr = objProto.toString;
 var symbolValueOf;
 if (typeof Symbol === 'function') {
   symbolValueOf = Symbol.prototype.valueOf;
+}
+var bigIntValueOf;
+if (typeof BigInt === 'function') {
+  bigIntValueOf = BigInt.prototype.valueOf;
 }
 var isActualNaN = function (value) {
   return value !== value;
@@ -8653,7 +11640,7 @@ var is = {};
  * is.type
  * Test if `value` is a type of `type`.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @param {String} type type
  * @return {Boolean} true if `value` is a type of `type`, false otherwise
  * @api public
@@ -8667,7 +11654,7 @@ is.a = is.type = function (value, type) {
  * is.defined
  * Test if `value` is defined.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if 'value' is defined, false otherwise
  * @api public
  */
@@ -8680,7 +11667,7 @@ is.defined = function (value) {
  * is.empty
  * Test if `value` is empty.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is empty, false otherwise
  * @api public
  */
@@ -8709,8 +11696,8 @@ is.empty = function (value) {
  * is.equal
  * Test if `value` is equal to `other`.
  *
- * @param {Mixed} value value to test
- * @param {Mixed} other value to compare with
+ * @param {*} value value to test
+ * @param {*} other value to compare with
  * @return {Boolean} true if `value` is equal to `other`, false otherwise
  */
 
@@ -8768,8 +11755,8 @@ is.equal = function equal(value, other) {
  * is.hosted
  * Test if `value` is hosted by `host`.
  *
- * @param {Mixed} value to test
- * @param {Mixed} host host to test with
+ * @param {*} value to test
+ * @param {*} host host to test with
  * @return {Boolean} true if `value` is hosted by `host`, false otherwise
  * @api public
  */
@@ -8783,7 +11770,7 @@ is.hosted = function (value, host) {
  * is.instance
  * Test if `value` is an instance of `constructor`.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is an instance of `constructor`
  * @api public
  */
@@ -8796,7 +11783,7 @@ is.instance = is['instanceof'] = function (value, constructor) {
  * is.nil / is.null
  * Test if `value` is null.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is null, false otherwise
  * @api public
  */
@@ -8809,7 +11796,7 @@ is.nil = is['null'] = function (value) {
  * is.undef / is.undefined
  * Test if `value` is undefined.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is undefined, false otherwise
  * @api public
  */
@@ -8826,7 +11813,7 @@ is.undef = is.undefined = function (value) {
  * is.args
  * Test if `value` is an arguments object.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is an arguments object, false otherwise
  * @api public
  */
@@ -8845,7 +11832,7 @@ is.args = is.arguments = function (value) {
  * is.array
  * Test if 'value' is an array.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is an array, false otherwise
  * @api public
  */
@@ -8858,7 +11845,7 @@ is.array = Array.isArray || function (value) {
  * is.arguments.empty
  * Test if `value` is an empty arguments object.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is an empty arguments object, false otherwise
  * @api public
  */
@@ -8870,7 +11857,7 @@ is.args.empty = function (value) {
  * is.array.empty
  * Test if `value` is an empty array.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is an empty array, false otherwise
  * @api public
  */
@@ -8882,7 +11869,7 @@ is.array.empty = function (value) {
  * is.arraylike
  * Test if `value` is an arraylike object.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is an arguments object, false otherwise
  * @api public
  */
@@ -8903,7 +11890,7 @@ is.arraylike = function (value) {
  * is.bool
  * Test if `value` is a boolean.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is a boolean, false otherwise
  * @api public
  */
@@ -8916,7 +11903,7 @@ is.bool = is['boolean'] = function (value) {
  * is.false
  * Test if `value` is false.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is false, false otherwise
  * @api public
  */
@@ -8929,7 +11916,7 @@ is['false'] = function (value) {
  * is.true
  * Test if `value` is true.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is true, false otherwise
  * @api public
  */
@@ -8946,7 +11933,7 @@ is['true'] = function (value) {
  * is.date
  * Test if `value` is a date.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is a date, false otherwise
  * @api public
  */
@@ -8959,7 +11946,7 @@ is.date = function (value) {
  * is.date.valid
  * Test if `value` is a valid date.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @returns {Boolean} true if `value` is a valid date, false otherwise
  */
 is.date.valid = function (value) {
@@ -8974,7 +11961,7 @@ is.date.valid = function (value) {
  * is.element
  * Test if `value` is an html element.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is an HTML Element, false otherwise
  * @api public
  */
@@ -8994,7 +11981,7 @@ is.element = function (value) {
  * is.error
  * Test if `value` is an error object.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is an error object, false otherwise
  * @api public
  */
@@ -9011,7 +11998,7 @@ is.error = function (value) {
  * is.fn / is.function (deprecated)
  * Test if `value` is a function.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is a function, false otherwise
  * @api public
  */
@@ -9033,7 +12020,7 @@ is.fn = is['function'] = function (value) {
  * is.number
  * Test if `value` is a number.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is a number, false otherwise
  * @api public
  */
@@ -9046,7 +12033,7 @@ is.number = function (value) {
  * is.infinite
  * Test if `value` is positive or negative infinity.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is positive or negative Infinity, false otherwise
  * @api public
  */
@@ -9058,7 +12045,7 @@ is.infinite = function (value) {
  * is.decimal
  * Test if `value` is a decimal number.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is a decimal number, false otherwise
  * @api public
  */
@@ -9155,7 +12142,7 @@ is.minimum = function (value, others) {
  * is.nan
  * Test if `value` is not a number.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is not a number, false otherwise
  * @api public
  */
@@ -9286,7 +12273,7 @@ is.within = function (value, start, finish) {
  * is.object
  * Test if `value` is an object.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is an object, false otherwise
  * @api public
  */
@@ -9298,7 +12285,7 @@ is.object = function (value) {
  * is.primitive
  * Test if `value` is a primitive.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is a primitive, false otherwise
  * @api public
  */
@@ -9316,7 +12303,7 @@ is.primitive = function isPrimitive(value) {
  * is.hash
  * Test if `value` is a hash - a plain object literal.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is a hash, false otherwise
  * @api public
  */
@@ -9333,7 +12320,7 @@ is.hash = function (value) {
  * is.regexp
  * Test if `value` is a regular expression.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is a regexp, false otherwise
  * @api public
  */
@@ -9350,7 +12337,7 @@ is.regexp = function (value) {
  * is.string
  * Test if `value` is a string.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if 'value' is a string, false otherwise
  * @api public
  */
@@ -9367,7 +12354,7 @@ is.string = function (value) {
  * is.base64
  * Test if `value` is a valid base64 encoded string.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if 'value' is a base64 encoded string, false otherwise
  * @api public
  */
@@ -9384,7 +12371,7 @@ is.base64 = function (value) {
  * is.hex
  * Test if `value` is a valid hex encoded string.
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if 'value' is a hex encoded string, false otherwise
  * @api public
  */
@@ -9397,7 +12384,7 @@ is.hex = function (value) {
  * is.symbol
  * Test if `value` is an ES6 Symbol
  *
- * @param {Mixed} value value to test
+ * @param {*} value value to test
  * @return {Boolean} true if `value` is a Symbol, false otherise
  * @api public
  */
@@ -9406,11 +12393,25 @@ is.symbol = function (value) {
   return typeof Symbol === 'function' && toStr.call(value) === '[object Symbol]' && typeof symbolValueOf.call(value) === 'symbol';
 };
 
+/**
+ * is.bigint
+ * Test if `value` is an ES-proposed BigInt
+ *
+ * @param {*} value value to test
+ * @return {Boolean} true if `value` is a BigInt, false otherise
+ * @api public
+ */
+
+is.bigint = function (value) {
+  // eslint-disable-next-line valid-typeof
+  return typeof BigInt === 'function' && toStr.call(value) === '[object BigInt]' && typeof bigIntValueOf.call(value) === 'bigint';
+};
+
 module.exports = is;
 
-},{}],82:[function(require,module,exports){
+},{}],95:[function(require,module,exports){
 (function (global){
-/*! JSON v3.3.2 | http://bestiejs.github.io/json3 | Copyright 2012-2014, Kit Cambridge | http://kit.mit-license.org */
+/*! JSON v3.3.2 | https://bestiejs.github.io/json3 | Copyright 2012-2015, Kit Cambridge, Benjamin Tan | http://kit.mit-license.org */
 ;(function () {
   // Detect the `define` function exposed by asynchronous module loaders. The
   // strict `define` check is necessary for compatibility with `r.js`.
@@ -9432,25 +12433,25 @@ module.exports = is;
   var root = objectTypes[typeof window] && window || this,
       freeGlobal = freeExports && objectTypes[typeof module] && module && !module.nodeType && typeof global == "object" && global;
 
-  if (freeGlobal && (freeGlobal["global"] === freeGlobal || freeGlobal["window"] === freeGlobal || freeGlobal["self"] === freeGlobal)) {
+  if (freeGlobal && (freeGlobal.global === freeGlobal || freeGlobal.window === freeGlobal || freeGlobal.self === freeGlobal)) {
     root = freeGlobal;
   }
 
   // Public: Initializes JSON 3 using the given `context` object, attaching the
   // `stringify` and `parse` functions to the specified `exports` object.
   function runInContext(context, exports) {
-    context || (context = root["Object"]());
-    exports || (exports = root["Object"]());
+    context || (context = root.Object());
+    exports || (exports = root.Object());
 
     // Native constructor aliases.
-    var Number = context["Number"] || root["Number"],
-        String = context["String"] || root["String"],
-        Object = context["Object"] || root["Object"],
-        Date = context["Date"] || root["Date"],
-        SyntaxError = context["SyntaxError"] || root["SyntaxError"],
-        TypeError = context["TypeError"] || root["TypeError"],
-        Math = context["Math"] || root["Math"],
-        nativeJSON = context["JSON"] || root["JSON"];
+    var Number = context.Number || root.Number,
+        String = context.String || root.String,
+        Object = context.Object || root.Object,
+        Date = context.Date || root.Date,
+        SyntaxError = context.SyntaxError || root.SyntaxError,
+        TypeError = context.TypeError || root.TypeError,
+        Math = context.Math || root.Math,
+        nativeJSON = context.JSON || root.JSON;
 
     // Delegate to the native `stringify` and `parse` implementations.
     if (typeof nativeJSON == "object" && nativeJSON) {
@@ -9461,24 +12462,34 @@ module.exports = is;
     // Convenience aliases.
     var objectProto = Object.prototype,
         getClass = objectProto.toString,
-        isProperty, forEach, undef;
+        isProperty = objectProto.hasOwnProperty,
+        undefined;
+
+    // Internal: Contains `try...catch` logic used by other functions.
+    // This prevents other functions from being deoptimized.
+    function attempt(func, errorFunc) {
+      try {
+        func();
+      } catch (exception) {
+        if (errorFunc) {
+          errorFunc();
+        }
+      }
+    }
 
     // Test the `Date#getUTC*` methods. Based on work by @Yaffle.
     var isExtended = new Date(-3509827334573292);
-    try {
+    attempt(function () {
       // The `getUTCFullYear`, `Month`, and `Date` methods return nonsensical
       // results for certain dates in Opera >= 10.53.
       isExtended = isExtended.getUTCFullYear() == -109252 && isExtended.getUTCMonth() === 0 && isExtended.getUTCDate() === 1 &&
-        // Safari < 2.0.2 stores the internal millisecond time value correctly,
-        // but clips the values returned by the date methods to the range of
-        // signed 32-bit integers ([-2 ** 31, 2 ** 31 - 1]).
         isExtended.getUTCHours() == 10 && isExtended.getUTCMinutes() == 37 && isExtended.getUTCSeconds() == 6 && isExtended.getUTCMilliseconds() == 708;
-    } catch (exception) {}
+    });
 
     // Internal: Determines whether the native `JSON.stringify` and `parse`
     // implementations are spec-compliant. Based on work by Ken Snyder.
     function has(name) {
-      if (has[name] !== undef) {
+      if (has[name] != null) {
         // Return cached feature test result.
         return has[name];
       }
@@ -9490,18 +12501,38 @@ module.exports = is;
       } else if (name == "json") {
         // Indicates whether both `JSON.stringify` and `JSON.parse` are
         // supported.
-        isSupported = has("json-stringify") && has("json-parse");
+        isSupported = has("json-stringify") && has("date-serialization") && has("json-parse");
+      } else if (name == "date-serialization") {
+        // Indicates whether `Date`s can be serialized accurately by `JSON.stringify`.
+        isSupported = has("json-stringify") && isExtended;
+        if (isSupported) {
+          var stringify = exports.stringify;
+          attempt(function () {
+            isSupported =
+              // JSON 2, Prototype <= 1.7, and older WebKit builds incorrectly
+              // serialize extended years.
+              stringify(new Date(-8.64e15)) == '"-271821-04-20T00:00:00.000Z"' &&
+              // The milliseconds are optional in ES 5, but required in 5.1.
+              stringify(new Date(8.64e15)) == '"+275760-09-13T00:00:00.000Z"' &&
+              // Firefox <= 11.0 incorrectly serializes years prior to 0 as negative
+              // four-digit years instead of six-digit years. Credits: @Yaffle.
+              stringify(new Date(-621987552e5)) == '"-000001-01-01T00:00:00.000Z"' &&
+              // Safari <= 5.1.5 and Opera >= 10.53 incorrectly serialize millisecond
+              // values less than 1000. Credits: @Yaffle.
+              stringify(new Date(-1)) == '"1969-12-31T23:59:59.999Z"';
+          });
+        }
       } else {
         var value, serialized = '{"a":[1,true,false,null,"\\u0000\\b\\n\\f\\r\\t"]}';
         // Test `JSON.stringify`.
         if (name == "json-stringify") {
-          var stringify = exports.stringify, stringifySupported = typeof stringify == "function" && isExtended;
+          var stringify = exports.stringify, stringifySupported = typeof stringify == "function";
           if (stringifySupported) {
             // A test function object with a custom `toJSON` method.
             (value = function () {
               return 1;
             }).toJSON = value;
-            try {
+            attempt(function () {
               stringifySupported =
                 // Firefox 3.1b1 and b2 serialize string, number, and boolean
                 // primitives as object literals.
@@ -9514,13 +12545,13 @@ module.exports = is;
                 // does not define a canonical JSON representation (this applies to
                 // objects with `toJSON` properties as well, *unless* they are nested
                 // within an object or array).
-                stringify(getClass) === undef &&
+                stringify(getClass) === undefined &&
                 // IE 8 serializes `undefined` as `"undefined"`. Safari <= 5.1.7 and
                 // FF 3.1b3 pass this test.
-                stringify(undef) === undef &&
+                stringify(undefined) === undefined &&
                 // Safari <= 5.1.7 and FF 3.1b3 throw `Error`s and `TypeError`s,
                 // respectively, if the value is omitted entirely.
-                stringify() === undef &&
+                stringify() === undefined &&
                 // FF 3.1b1, 2 throw an error if the given value is not a number,
                 // string, array, object, Boolean, or `null` literal. This applies to
                 // objects with custom `toJSON` methods as well, unless they are nested
@@ -9530,81 +12561,71 @@ module.exports = is;
                 stringify([value]) == "[1]" &&
                 // Prototype <= 1.6.1 serializes `[undefined]` as `"[]"` instead of
                 // `"[null]"`.
-                stringify([undef]) == "[null]" &&
+                stringify([undefined]) == "[null]" &&
                 // YUI 3.0.0b1 fails to serialize `null` literals.
                 stringify(null) == "null" &&
                 // FF 3.1b1, 2 halts serialization if an array contains a function:
                 // `[1, true, getClass, 1]` serializes as "[1,true,],". FF 3.1b3
                 // elides non-JSON values from objects and arrays, unless they
                 // define custom `toJSON` methods.
-                stringify([undef, getClass, null]) == "[null,null,null]" &&
+                stringify([undefined, getClass, null]) == "[null,null,null]" &&
                 // Simple serialization test. FF 3.1b1 uses Unicode escape sequences
                 // where character escape codes are expected (e.g., `\b` => `\u0008`).
                 stringify({ "a": [value, true, false, null, "\x00\b\n\f\r\t"] }) == serialized &&
                 // FF 3.1b1 and b2 ignore the `filter` and `width` arguments.
                 stringify(null, value) === "1" &&
-                stringify([1, 2], null, 1) == "[\n 1,\n 2\n]" &&
-                // JSON 2, Prototype <= 1.7, and older WebKit builds incorrectly
-                // serialize extended years.
-                stringify(new Date(-8.64e15)) == '"-271821-04-20T00:00:00.000Z"' &&
-                // The milliseconds are optional in ES 5, but required in 5.1.
-                stringify(new Date(8.64e15)) == '"+275760-09-13T00:00:00.000Z"' &&
-                // Firefox <= 11.0 incorrectly serializes years prior to 0 as negative
-                // four-digit years instead of six-digit years. Credits: @Yaffle.
-                stringify(new Date(-621987552e5)) == '"-000001-01-01T00:00:00.000Z"' &&
-                // Safari <= 5.1.5 and Opera >= 10.53 incorrectly serialize millisecond
-                // values less than 1000. Credits: @Yaffle.
-                stringify(new Date(-1)) == '"1969-12-31T23:59:59.999Z"';
-            } catch (exception) {
+                stringify([1, 2], null, 1) == "[\n 1,\n 2\n]";
+            }, function () {
               stringifySupported = false;
-            }
+            });
           }
           isSupported = stringifySupported;
         }
         // Test `JSON.parse`.
         if (name == "json-parse") {
-          var parse = exports.parse;
+          var parse = exports.parse, parseSupported;
           if (typeof parse == "function") {
-            try {
+            attempt(function () {
               // FF 3.1b1, b2 will throw an exception if a bare literal is provided.
               // Conforming implementations should also coerce the initial argument to
               // a string prior to parsing.
               if (parse("0") === 0 && !parse(false)) {
                 // Simple parsing test.
                 value = parse(serialized);
-                var parseSupported = value["a"].length == 5 && value["a"][0] === 1;
+                parseSupported = value["a"].length == 5 && value["a"][0] === 1;
                 if (parseSupported) {
-                  try {
+                  attempt(function () {
                     // Safari <= 5.1.2 and FF 3.1b1 allow unescaped tabs in strings.
                     parseSupported = !parse('"\t"');
-                  } catch (exception) {}
+                  });
                   if (parseSupported) {
-                    try {
+                    attempt(function () {
                       // FF 4.0 and 4.0.1 allow leading `+` signs and leading
                       // decimal points. FF 4.0, 4.0.1, and IE 9-10 also allow
                       // certain octal literals.
                       parseSupported = parse("01") !== 1;
-                    } catch (exception) {}
+                    });
                   }
                   if (parseSupported) {
-                    try {
+                    attempt(function () {
                       // FF 4.0, 4.0.1, and Rhino 1.7R3-R4 allow trailing decimal
                       // points. These environments, along with FF 3.1b1 and 2,
                       // also allow trailing commas in JSON objects and arrays.
                       parseSupported = parse("1.") !== 1;
-                    } catch (exception) {}
+                    });
                   }
                 }
               }
-            } catch (exception) {
+            }, function () {
               parseSupported = false;
-            }
+            });
           }
           isSupported = parseSupported;
         }
       }
       return has[name] = !!isSupported;
     }
+    has["bug-string-char-index"] = has["date-serialization"] = has["json"] = has["json-stringify"] = has["json-parse"] = null;
 
     if (!has("json")) {
       // Common `[[Class]]` name aliases.
@@ -9618,59 +12639,10 @@ module.exports = is;
       // Detect incomplete support for accessing string characters by index.
       var charIndexBuggy = has("bug-string-char-index");
 
-      // Define additional utility methods if the `Date` methods are buggy.
-      if (!isExtended) {
-        var floor = Math.floor;
-        // A mapping between the months of the year and the number of days between
-        // January 1st and the first of the respective month.
-        var Months = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-        // Internal: Calculates the number of days between the Unix epoch and the
-        // first day of the given month.
-        var getDay = function (year, month) {
-          return Months[month] + 365 * (year - 1970) + floor((year - 1969 + (month = +(month > 1))) / 4) - floor((year - 1901 + month) / 100) + floor((year - 1601 + month) / 400);
-        };
-      }
-
-      // Internal: Determines if a property is a direct property of the given
-      // object. Delegates to the native `Object#hasOwnProperty` method.
-      if (!(isProperty = objectProto.hasOwnProperty)) {
-        isProperty = function (property) {
-          var members = {}, constructor;
-          if ((members.__proto__ = null, members.__proto__ = {
-            // The *proto* property cannot be set multiple times in recent
-            // versions of Firefox and SeaMonkey.
-            "toString": 1
-          }, members).toString != getClass) {
-            // Safari <= 2.0.3 doesn't implement `Object#hasOwnProperty`, but
-            // supports the mutable *proto* property.
-            isProperty = function (property) {
-              // Capture and break the object's prototype chain (see section 8.6.2
-              // of the ES 5.1 spec). The parenthesized expression prevents an
-              // unsafe transformation by the Closure Compiler.
-              var original = this.__proto__, result = property in (this.__proto__ = null, this);
-              // Restore the original prototype chain.
-              this.__proto__ = original;
-              return result;
-            };
-          } else {
-            // Capture a reference to the top-level `Object` constructor.
-            constructor = members.constructor;
-            // Use the `constructor` property to simulate `Object#hasOwnProperty` in
-            // other environments.
-            isProperty = function (property) {
-              var parent = (this.constructor || constructor).prototype;
-              return property in this && !(property in parent && this[property] === parent[property]);
-            };
-          }
-          members = null;
-          return isProperty.call(this, property);
-        };
-      }
-
       // Internal: Normalizes the `for...in` iteration algorithm across
       // environments. Each enumerated key is yielded to a `callback` function.
-      forEach = function (object, callback) {
-        var size = 0, Properties, members, property;
+      var forOwn = function (object, callback) {
+        var size = 0, Properties, dontEnums, property;
 
         // Tests for bugs in the current environment's `for...in` algorithm. The
         // `valueOf` property inherits the non-enumerable flag from
@@ -9680,22 +12652,22 @@ module.exports = is;
         }).prototype.valueOf = 0;
 
         // Iterate over a new instance of the `Properties` class.
-        members = new Properties();
-        for (property in members) {
+        dontEnums = new Properties();
+        for (property in dontEnums) {
           // Ignore all properties inherited from `Object.prototype`.
-          if (isProperty.call(members, property)) {
+          if (isProperty.call(dontEnums, property)) {
             size++;
           }
         }
-        Properties = members = null;
+        Properties = dontEnums = null;
 
         // Normalize the iteration algorithm.
         if (!size) {
           // A list of non-enumerable properties inherited from `Object.prototype`.
-          members = ["valueOf", "toString", "toLocaleString", "propertyIsEnumerable", "isPrototypeOf", "hasOwnProperty", "constructor"];
+          dontEnums = ["valueOf", "toString", "toLocaleString", "propertyIsEnumerable", "isPrototypeOf", "hasOwnProperty", "constructor"];
           // IE <= 8, Mozilla 1.0, and Netscape 6.2 ignore shadowed non-enumerable
           // properties.
-          forEach = function (object, callback) {
+          forOwn = function (object, callback) {
             var isFunction = getClass.call(object) == functionClass, property, length;
             var hasProperty = !isFunction && typeof object.constructor != "function" && objectTypes[typeof object.hasOwnProperty] && object.hasOwnProperty || isProperty;
             for (property in object) {
@@ -9706,25 +12678,15 @@ module.exports = is;
               }
             }
             // Manually invoke the callback for each non-enumerable property.
-            for (length = members.length; property = members[--length]; hasProperty.call(object, property) && callback(property));
-          };
-        } else if (size == 2) {
-          // Safari <= 2.0.4 enumerates shadowed properties twice.
-          forEach = function (object, callback) {
-            // Create a set of iterated properties.
-            var members = {}, isFunction = getClass.call(object) == functionClass, property;
-            for (property in object) {
-              // Store each property name to prevent double enumeration. The
-              // `prototype` property of functions is not enumerated due to cross-
-              // environment inconsistencies.
-              if (!(isFunction && property == "prototype") && !isProperty.call(members, property) && (members[property] = 1) && isProperty.call(object, property)) {
+            for (length = dontEnums.length; property = dontEnums[--length];) {
+              if (hasProperty.call(object, property)) {
                 callback(property);
               }
             }
           };
         } else {
           // No bugs detected; use the standard `for...in` algorithm.
-          forEach = function (object, callback) {
+          forOwn = function (object, callback) {
             var isFunction = getClass.call(object) == functionClass, property, isConstructor;
             for (property in object) {
               if (!(isFunction && property == "prototype") && isProperty.call(object, property) && !(isConstructor = property === "constructor")) {
@@ -9738,7 +12700,7 @@ module.exports = is;
             }
           };
         }
-        return forEach(object, callback);
+        return forOwn(object, callback);
       };
 
       // Public: Serializes a JavaScript `value` as a JSON string. The optional
@@ -9747,7 +12709,7 @@ module.exports = is;
       // indicates which properties should be serialized. The optional `width`
       // argument may be either a string or number that specifies the indentation
       // level of the output.
-      if (!has("json-stringify")) {
+      if (!has("json-stringify") && !has("date-serialization")) {
         // Internal: A map of control characters and their escaped equivalents.
         var Escapes = {
           92: "\\\\",
@@ -9768,190 +12730,250 @@ module.exports = is;
           return (leadingZeroes + (value || 0)).slice(-width);
         };
 
-        // Internal: Double-quotes a string `value`, replacing all ASCII control
-        // characters (characters with code unit values between 0 and 31) with
-        // their escaped equivalents. This is an implementation of the
-        // `Quote(value)` operation defined in ES 5.1 section 15.12.3.
-        var unicodePrefix = "\\u00";
-        var quote = function (value) {
-          var result = '"', index = 0, length = value.length, useCharIndex = !charIndexBuggy || length > 10;
-          var symbols = useCharIndex && (charIndexBuggy ? value.split("") : value);
-          for (; index < length; index++) {
-            var charCode = value.charCodeAt(index);
-            // If the character is a control character, append its Unicode or
-            // shorthand escape sequence; otherwise, append the character as-is.
-            switch (charCode) {
-              case 8: case 9: case 10: case 12: case 13: case 34: case 92:
-                result += Escapes[charCode];
-                break;
-              default:
-                if (charCode < 32) {
-                  result += unicodePrefix + toPaddedString(2, charCode.toString(16));
-                  break;
-                }
-                result += useCharIndex ? symbols[index] : value.charAt(index);
-            }
+        // Internal: Serializes a date object.
+        var serializeDate = function (value) {
+          var getData, year, month, date, time, hours, minutes, seconds, milliseconds;
+          // Define additional utility methods if the `Date` methods are buggy.
+          if (!isExtended) {
+            var floor = Math.floor;
+            // A mapping between the months of the year and the number of days between
+            // January 1st and the first of the respective month.
+            var Months = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+            // Internal: Calculates the number of days between the Unix epoch and the
+            // first day of the given month.
+            var getDay = function (year, month) {
+              return Months[month] + 365 * (year - 1970) + floor((year - 1969 + (month = +(month > 1))) / 4) - floor((year - 1901 + month) / 100) + floor((year - 1601 + month) / 400);
+            };
+            getData = function (value) {
+              // Manually compute the year, month, date, hours, minutes,
+              // seconds, and milliseconds if the `getUTC*` methods are
+              // buggy. Adapted from @Yaffle's `date-shim` project.
+              date = floor(value / 864e5);
+              for (year = floor(date / 365.2425) + 1970 - 1; getDay(year + 1, 0) <= date; year++);
+              for (month = floor((date - getDay(year, 0)) / 30.42); getDay(year, month + 1) <= date; month++);
+              date = 1 + date - getDay(year, month);
+              // The `time` value specifies the time within the day (see ES
+              // 5.1 section 15.9.1.2). The formula `(A % B + B) % B` is used
+              // to compute `A modulo B`, as the `%` operator does not
+              // correspond to the `modulo` operation for negative numbers.
+              time = (value % 864e5 + 864e5) % 864e5;
+              // The hours, minutes, seconds, and milliseconds are obtained by
+              // decomposing the time within the day. See section 15.9.1.10.
+              hours = floor(time / 36e5) % 24;
+              minutes = floor(time / 6e4) % 60;
+              seconds = floor(time / 1e3) % 60;
+              milliseconds = time % 1e3;
+            };
+          } else {
+            getData = function (value) {
+              year = value.getUTCFullYear();
+              month = value.getUTCMonth();
+              date = value.getUTCDate();
+              hours = value.getUTCHours();
+              minutes = value.getUTCMinutes();
+              seconds = value.getUTCSeconds();
+              milliseconds = value.getUTCMilliseconds();
+            };
           }
-          return result + '"';
+          serializeDate = function (value) {
+            if (value > -1 / 0 && value < 1 / 0) {
+              // Dates are serialized according to the `Date#toJSON` method
+              // specified in ES 5.1 section 15.9.5.44. See section 15.9.1.15
+              // for the ISO 8601 date time string format.
+              getData(value);
+              // Serialize extended years correctly.
+              value = (year <= 0 || year >= 1e4 ? (year < 0 ? "-" : "+") + toPaddedString(6, year < 0 ? -year : year) : toPaddedString(4, year)) +
+              "-" + toPaddedString(2, month + 1) + "-" + toPaddedString(2, date) +
+              // Months, dates, hours, minutes, and seconds should have two
+              // digits; milliseconds should have three.
+              "T" + toPaddedString(2, hours) + ":" + toPaddedString(2, minutes) + ":" + toPaddedString(2, seconds) +
+              // Milliseconds are optional in ES 5.0, but required in 5.1.
+              "." + toPaddedString(3, milliseconds) + "Z";
+              year = month = date = hours = minutes = seconds = milliseconds = null;
+            } else {
+              value = null;
+            }
+            return value;
+          };
+          return serializeDate(value);
         };
 
-        // Internal: Recursively serializes an object. Implements the
-        // `Str(key, holder)`, `JO(value)`, and `JA(value)` operations.
-        var serialize = function (property, object, callback, properties, whitespace, indentation, stack) {
-          var value, className, year, month, date, time, hours, minutes, seconds, milliseconds, results, element, index, length, prefix, result;
-          try {
-            // Necessary for host object support.
-            value = object[property];
-          } catch (exception) {}
-          if (typeof value == "object" && value) {
-            className = getClass.call(value);
-            if (className == dateClass && !isProperty.call(value, "toJSON")) {
-              if (value > -1 / 0 && value < 1 / 0) {
-                // Dates are serialized according to the `Date#toJSON` method
-                // specified in ES 5.1 section 15.9.5.44. See section 15.9.1.15
-                // for the ISO 8601 date time string format.
-                if (getDay) {
-                  // Manually compute the year, month, date, hours, minutes,
-                  // seconds, and milliseconds if the `getUTC*` methods are
-                  // buggy. Adapted from @Yaffle's `date-shim` project.
-                  date = floor(value / 864e5);
-                  for (year = floor(date / 365.2425) + 1970 - 1; getDay(year + 1, 0) <= date; year++);
-                  for (month = floor((date - getDay(year, 0)) / 30.42); getDay(year, month + 1) <= date; month++);
-                  date = 1 + date - getDay(year, month);
-                  // The `time` value specifies the time within the day (see ES
-                  // 5.1 section 15.9.1.2). The formula `(A % B + B) % B` is used
-                  // to compute `A modulo B`, as the `%` operator does not
-                  // correspond to the `modulo` operation for negative numbers.
-                  time = (value % 864e5 + 864e5) % 864e5;
-                  // The hours, minutes, seconds, and milliseconds are obtained by
-                  // decomposing the time within the day. See section 15.9.1.10.
-                  hours = floor(time / 36e5) % 24;
-                  minutes = floor(time / 6e4) % 60;
-                  seconds = floor(time / 1e3) % 60;
-                  milliseconds = time % 1e3;
-                } else {
-                  year = value.getUTCFullYear();
-                  month = value.getUTCMonth();
-                  date = value.getUTCDate();
-                  hours = value.getUTCHours();
-                  minutes = value.getUTCMinutes();
-                  seconds = value.getUTCSeconds();
-                  milliseconds = value.getUTCMilliseconds();
-                }
-                // Serialize extended years correctly.
-                value = (year <= 0 || year >= 1e4 ? (year < 0 ? "-" : "+") + toPaddedString(6, year < 0 ? -year : year) : toPaddedString(4, year)) +
-                  "-" + toPaddedString(2, month + 1) + "-" + toPaddedString(2, date) +
-                  // Months, dates, hours, minutes, and seconds should have two
-                  // digits; milliseconds should have three.
-                  "T" + toPaddedString(2, hours) + ":" + toPaddedString(2, minutes) + ":" + toPaddedString(2, seconds) +
-                  // Milliseconds are optional in ES 5.0, but required in 5.1.
-                  "." + toPaddedString(3, milliseconds) + "Z";
-              } else {
-                value = null;
-              }
-            } else if (typeof value.toJSON == "function" && ((className != numberClass && className != stringClass && className != arrayClass) || isProperty.call(value, "toJSON"))) {
-              // Prototype <= 1.6.1 adds non-standard `toJSON` methods to the
-              // `Number`, `String`, `Date`, and `Array` prototypes. JSON 3
-              // ignores all `toJSON` methods on these objects unless they are
-              // defined directly on an instance.
-              value = value.toJSON(property);
-            }
+        // For environments with `JSON.stringify` but buggy date serialization,
+        // we override the native `Date#toJSON` implementation with a
+        // spec-compliant one.
+        if (has("json-stringify") && !has("date-serialization")) {
+          // Internal: the `Date#toJSON` implementation used to override the native one.
+          function dateToJSON (key) {
+            return serializeDate(this);
           }
-          if (callback) {
-            // If a replacement function was provided, call it to obtain the value
-            // for serialization.
-            value = callback.call(object, property, value);
-          }
-          if (value === null) {
-            return "null";
-          }
-          className = getClass.call(value);
-          if (className == booleanClass) {
-            // Booleans are represented literally.
-            return "" + value;
-          } else if (className == numberClass) {
-            // JSON numbers must be finite. `Infinity` and `NaN` are serialized as
-            // `"null"`.
-            return value > -1 / 0 && value < 1 / 0 ? "" + value : "null";
-          } else if (className == stringClass) {
-            // Strings are double-quoted and escaped.
-            return quote("" + value);
-          }
-          // Recursively serialize objects and arrays.
-          if (typeof value == "object") {
-            // Check for cyclic structures. This is a linear search; performance
-            // is inversely proportional to the number of unique nested objects.
-            for (length = stack.length; length--;) {
-              if (stack[length] === value) {
-                // Cyclic structures cannot be serialized by `JSON.stringify`.
-                throw TypeError();
-              }
-            }
-            // Add the object to the stack of traversed objects.
-            stack.push(value);
-            results = [];
-            // Save the current indentation level and indent one additional level.
-            prefix = indentation;
-            indentation += whitespace;
-            if (className == arrayClass) {
-              // Recursively serialize array elements.
-              for (index = 0, length = value.length; index < length; index++) {
-                element = serialize(index, value, callback, properties, whitespace, indentation, stack);
-                results.push(element === undef ? "null" : element);
-              }
-              result = results.length ? (whitespace ? "[\n" + indentation + results.join(",\n" + indentation) + "\n" + prefix + "]" : ("[" + results.join(",") + "]")) : "[]";
-            } else {
-              // Recursively serialize object members. Members are selected from
-              // either a user-specified list of property names, or the object
-              // itself.
-              forEach(properties || value, function (property) {
-                var element = serialize(property, value, callback, properties, whitespace, indentation, stack);
-                if (element !== undef) {
-                  // According to ES 5.1 section 15.12.3: "If `gap` {whitespace}
-                  // is not the empty string, let `member` {quote(property) + ":"}
-                  // be the concatenation of `member` and the `space` character."
-                  // The "`space` character" refers to the literal space
-                  // character, not the `space` {width} argument provided to
-                  // `JSON.stringify`.
-                  results.push(quote(property) + ":" + (whitespace ? " " : "") + element);
-                }
-              });
-              result = results.length ? (whitespace ? "{\n" + indentation + results.join(",\n" + indentation) + "\n" + prefix + "}" : ("{" + results.join(",") + "}")) : "{}";
-            }
-            // Remove the object from the traversed object stack.
-            stack.pop();
+
+          // Public: `JSON.stringify`. See ES 5.1 section 15.12.3.
+          var nativeStringify = exports.stringify;
+          exports.stringify = function (source, filter, width) {
+            var nativeToJSON = Date.prototype.toJSON;
+            Date.prototype.toJSON = dateToJSON;
+            var result = nativeStringify(source, filter, width);
+            Date.prototype.toJSON = nativeToJSON;
             return result;
           }
-        };
+        } else {
+          // Internal: Double-quotes a string `value`, replacing all ASCII control
+          // characters (characters with code unit values between 0 and 31) with
+          // their escaped equivalents. This is an implementation of the
+          // `Quote(value)` operation defined in ES 5.1 section 15.12.3.
+          var unicodePrefix = "\\u00";
+          var escapeChar = function (character) {
+            var charCode = character.charCodeAt(0), escaped = Escapes[charCode];
+            if (escaped) {
+              return escaped;
+            }
+            return unicodePrefix + toPaddedString(2, charCode.toString(16));
+          };
+          var reEscape = /[\x00-\x1f\x22\x5c]/g;
+          var quote = function (value) {
+            reEscape.lastIndex = 0;
+            return '"' +
+              (
+                reEscape.test(value)
+                  ? value.replace(reEscape, escapeChar)
+                  : value
+              ) +
+              '"';
+          };
 
-        // Public: `JSON.stringify`. See ES 5.1 section 15.12.3.
-        exports.stringify = function (source, filter, width) {
-          var whitespace, callback, properties, className;
-          if (objectTypes[typeof filter] && filter) {
-            if ((className = getClass.call(filter)) == functionClass) {
-              callback = filter;
-            } else if (className == arrayClass) {
-              // Convert the property names array into a makeshift set.
-              properties = {};
-              for (var index = 0, length = filter.length, value; index < length; value = filter[index++], ((className = getClass.call(value)), className == stringClass || className == numberClass) && (properties[value] = 1));
-            }
-          }
-          if (width) {
-            if ((className = getClass.call(width)) == numberClass) {
-              // Convert the `width` to an integer and create a string containing
-              // `width` number of space characters.
-              if ((width -= width % 1) > 0) {
-                for (whitespace = "", width > 10 && (width = 10); whitespace.length < width; whitespace += " ");
+          // Internal: Recursively serializes an object. Implements the
+          // `Str(key, holder)`, `JO(value)`, and `JA(value)` operations.
+          var serialize = function (property, object, callback, properties, whitespace, indentation, stack) {
+            var value, type, className, results, element, index, length, prefix, result;
+            attempt(function () {
+              // Necessary for host object support.
+              value = object[property];
+            });
+            if (typeof value == "object" && value) {
+              if (value.getUTCFullYear && getClass.call(value) == dateClass && value.toJSON === Date.prototype.toJSON) {
+                value = serializeDate(value);
+              } else if (typeof value.toJSON == "function") {
+                value = value.toJSON(property);
               }
-            } else if (className == stringClass) {
-              whitespace = width.length <= 10 ? width : width.slice(0, 10);
             }
-          }
-          // Opera <= 7.54u2 discards the values associated with empty string keys
-          // (`""`) only if they are used directly within an object member list
-          // (e.g., `!("" in { "": 1})`).
-          return serialize("", (value = {}, value[""] = source, value), callback, properties, whitespace, "", []);
-        };
+            if (callback) {
+              // If a replacement function was provided, call it to obtain the value
+              // for serialization.
+              value = callback.call(object, property, value);
+            }
+            // Exit early if value is `undefined` or `null`.
+            if (value == undefined) {
+              return value === undefined ? value : "null";
+            }
+            type = typeof value;
+            // Only call `getClass` if the value is an object.
+            if (type == "object") {
+              className = getClass.call(value);
+            }
+            switch (className || type) {
+              case "boolean":
+              case booleanClass:
+                // Booleans are represented literally.
+                return "" + value;
+              case "number":
+              case numberClass:
+                // JSON numbers must be finite. `Infinity` and `NaN` are serialized as
+                // `"null"`.
+                return value > -1 / 0 && value < 1 / 0 ? "" + value : "null";
+              case "string":
+              case stringClass:
+                // Strings are double-quoted and escaped.
+                return quote("" + value);
+            }
+            // Recursively serialize objects and arrays.
+            if (typeof value == "object") {
+              // Check for cyclic structures. This is a linear search; performance
+              // is inversely proportional to the number of unique nested objects.
+              for (length = stack.length; length--;) {
+                if (stack[length] === value) {
+                  // Cyclic structures cannot be serialized by `JSON.stringify`.
+                  throw TypeError();
+                }
+              }
+              // Add the object to the stack of traversed objects.
+              stack.push(value);
+              results = [];
+              // Save the current indentation level and indent one additional level.
+              prefix = indentation;
+              indentation += whitespace;
+              if (className == arrayClass) {
+                // Recursively serialize array elements.
+                for (index = 0, length = value.length; index < length; index++) {
+                  element = serialize(index, value, callback, properties, whitespace, indentation, stack);
+                  results.push(element === undefined ? "null" : element);
+                }
+                result = results.length ? (whitespace ? "[\n" + indentation + results.join(",\n" + indentation) + "\n" + prefix + "]" : ("[" + results.join(",") + "]")) : "[]";
+              } else {
+                // Recursively serialize object members. Members are selected from
+                // either a user-specified list of property names, or the object
+                // itself.
+                forOwn(properties || value, function (property) {
+                  var element = serialize(property, value, callback, properties, whitespace, indentation, stack);
+                  if (element !== undefined) {
+                    // According to ES 5.1 section 15.12.3: "If `gap` {whitespace}
+                    // is not the empty string, let `member` {quote(property) + ":"}
+                    // be the concatenation of `member` and the `space` character."
+                    // The "`space` character" refers to the literal space
+                    // character, not the `space` {width} argument provided to
+                    // `JSON.stringify`.
+                    results.push(quote(property) + ":" + (whitespace ? " " : "") + element);
+                  }
+                });
+                result = results.length ? (whitespace ? "{\n" + indentation + results.join(",\n" + indentation) + "\n" + prefix + "}" : ("{" + results.join(",") + "}")) : "{}";
+              }
+              // Remove the object from the traversed object stack.
+              stack.pop();
+              return result;
+            }
+          };
+
+          // Public: `JSON.stringify`. See ES 5.1 section 15.12.3.
+          exports.stringify = function (source, filter, width) {
+            var whitespace, callback, properties, className;
+            if (objectTypes[typeof filter] && filter) {
+              className = getClass.call(filter);
+              if (className == functionClass) {
+                callback = filter;
+              } else if (className == arrayClass) {
+                // Convert the property names array into a makeshift set.
+                properties = {};
+                for (var index = 0, length = filter.length, value; index < length;) {
+                  value = filter[index++];
+                  className = getClass.call(value);
+                  if (className == "[object String]" || className == "[object Number]") {
+                    properties[value] = 1;
+                  }
+                }
+              }
+            }
+            if (width) {
+              className = getClass.call(width);
+              if (className == numberClass) {
+                // Convert the `width` to an integer and create a string containing
+                // `width` number of space characters.
+                if ((width -= width % 1) > 0) {
+                  if (width > 10) {
+                    width = 10;
+                  }
+                  for (whitespace = ""; whitespace.length < width;) {
+                    whitespace += " ";
+                  }
+                }
+              } else if (className == stringClass) {
+                whitespace = width.length <= 10 ? width : width.slice(0, 10);
+              }
+            }
+            // Opera <= 7.54u2 discards the values associated with empty string keys
+            // (`""`) only if they are used directly within an object member list
+            // (e.g., `!("" in { "": 1})`).
+            return serialize("", (value = {}, value[""] = source, value), callback, properties, whitespace, "", []);
+          };
+        }
       }
 
       // Public: Parses a JSON source string.
@@ -10088,7 +13110,12 @@ module.exports = is;
                   if (source.charCodeAt(Index) == 46) {
                     position = ++Index;
                     // Parse the decimal component.
-                    for (; position < length && ((charCode = source.charCodeAt(position)), charCode >= 48 && charCode <= 57); position++);
+                    for (; position < length; position++) {
+                      charCode = source.charCodeAt(position);
+                      if (charCode < 48 || charCode > 57) {
+                        break;
+                      }
+                    }
                     if (position == Index) {
                       // Illegal trailing decimal.
                       abort();
@@ -10106,7 +13133,12 @@ module.exports = is;
                       Index++;
                     }
                     // Parse the exponential component.
-                    for (position = Index; position < length && ((charCode = source.charCodeAt(position)), charCode >= 48 && charCode <= 57); position++);
+                    for (position = Index; position < length; position++) {
+                      charCode = source.charCodeAt(position);
+                      if (charCode < 48 || charCode > 57) {
+                        break;
+                      }
+                    }
                     if (position == Index) {
                       // Illegal empty exponent.
                       abort();
@@ -10121,13 +13153,14 @@ module.exports = is;
                   abort();
                 }
                 // `true`, `false`, and `null` literals.
-                if (source.slice(Index, Index + 4) == "true") {
+                var temp = source.slice(Index, Index + 4);
+                if (temp == "true") {
                   Index += 4;
                   return true;
-                } else if (source.slice(Index, Index + 5) == "false") {
+                } else if (temp == "fals" && source.charCodeAt(Index + 4 ) == 101) {
                   Index += 5;
                   return false;
-                } else if (source.slice(Index, Index + 4) == "null") {
+                } else if (temp == "null") {
                   Index += 4;
                   return null;
                 }
@@ -10156,7 +13189,7 @@ module.exports = is;
             if (value == "[") {
               // Parses a JSON array, returning a new JavaScript array.
               results = [];
-              for (;; hasMembers || (hasMembers = true)) {
+              for (;;) {
                 value = lex();
                 // A closing square bracket marks the end of the array literal.
                 if (value == "]") {
@@ -10176,6 +13209,8 @@ module.exports = is;
                     // A `,` must separate each array element.
                     abort();
                   }
+                } else {
+                  hasMembers = true;
                 }
                 // Elisions and leading commas are not permitted.
                 if (value == ",") {
@@ -10187,7 +13222,7 @@ module.exports = is;
             } else if (value == "{") {
               // Parses a JSON object, returning a new JavaScript object.
               results = {};
-              for (;; hasMembers || (hasMembers = true)) {
+              for (;;) {
                 value = lex();
                 // A closing curly brace marks the end of the object literal.
                 if (value == "}") {
@@ -10206,6 +13241,8 @@ module.exports = is;
                     // A `,` must separate each object member.
                     abort();
                   }
+                } else {
+                  hasMembers = true;
                 }
                 // Leading commas are not permitted, object property names must be
                 // double-quoted strings, and a `:` must separate each property
@@ -10226,7 +13263,7 @@ module.exports = is;
         // Internal: Updates a traversed object member.
         var update = function (source, property, callback) {
           var element = walk(source, property, callback);
-          if (element === undef) {
+          if (element === undefined) {
             delete source[property];
           } else {
             source[property] = element;
@@ -10239,15 +13276,15 @@ module.exports = is;
         var walk = function (source, property, callback) {
           var value = source[property], length;
           if (typeof value == "object" && value) {
-            // `forEach` can't be used to traverse an array in Opera <= 8.54
+            // `forOwn` can't be used to traverse an array in Opera <= 8.54
             // because its `Object#hasOwnProperty` implementation returns `false`
             // for array indices (e.g., `![1, 2, 3].hasOwnProperty("0")`).
             if (getClass.call(value) == arrayClass) {
               for (length = value.length; length--;) {
-                update(value, length, callback);
+                update(getClass, forOwn, value, length, callback);
               }
             } else {
-              forEach(value, function (property) {
+              forOwn(value, function (property) {
                 update(value, property, callback);
               });
             }
@@ -10272,7 +13309,7 @@ module.exports = is;
       }
     }
 
-    exports["runInContext"] = runInContext;
+    exports.runInContext = runInContext;
     return exports;
   }
 
@@ -10282,17 +13319,17 @@ module.exports = is;
   } else {
     // Export for web browsers and JavaScript engines.
     var nativeJSON = root.JSON,
-        previousJSON = root["JSON3"],
+        previousJSON = root.JSON3,
         isRestored = false;
 
-    var JSON3 = runInContext(root, (root["JSON3"] = {
+    var JSON3 = runInContext(root, (root.JSON3 = {
       // Public: Restores the original value of the global `JSON` object and
       // returns a reference to the `JSON3` object.
       "noConflict": function () {
         if (!isRestored) {
           isRestored = true;
           root.JSON = nativeJSON;
-          root["JSON3"] = previousJSON;
+          root.JSON3 = previousJSON;
           nativeJSON = previousJSON = null;
         }
         return JSON3;
@@ -10314,7 +13351,7 @@ module.exports = is;
 }).call(this);
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],83:[function(require,module,exports){
+},{}],96:[function(require,module,exports){
 /**
  * Module dependencies
  */
@@ -10413,11 +13450,11 @@ function jsonp(url, opts, fn){
   return cancel;
 }
 
-},{"debug":84}],84:[function(require,module,exports){
-arguments[4][35][0].apply(exports,arguments)
-},{"./debug":85,"_process":94,"dup":35}],85:[function(require,module,exports){
-arguments[4][36][0].apply(exports,arguments)
-},{"dup":36,"ms":87}],86:[function(require,module,exports){
+},{"debug":97}],97:[function(require,module,exports){
+arguments[4][38][0].apply(exports,arguments)
+},{"./debug":98,"_process":108,"dup":38}],98:[function(require,module,exports){
+arguments[4][39][0].apply(exports,arguments)
+},{"dup":39,"ms":100}],99:[function(require,module,exports){
 /**
  * Module dependencies.
  */
@@ -10479,7 +13516,7 @@ module.exports = function loadIframe(options, fn){
   return iframe;
 };
 
-},{"is":81,"next-tick":92,"script-onload":95}],87:[function(require,module,exports){
+},{"is":94,"next-tick":105,"script-onload":110}],100:[function(require,module,exports){
 /**
  * Helpers.
  */
@@ -10633,7 +13670,7 @@ function plural(ms, n, name) {
   return Math.ceil(ms / n) + ' ' + name + 's';
 }
 
-},{}],88:[function(require,module,exports){
+},{}],101:[function(require,module,exports){
 'use strict';
 
 var is = require('is');
@@ -10678,7 +13715,7 @@ function toMs(num) {
   return num;
 }
 
-},{"./milliseconds":89,"./seconds":90,"@segment/isodate":91,"is":81}],89:[function(require,module,exports){
+},{"./milliseconds":102,"./seconds":103,"@segment/isodate":104,"is":94}],102:[function(require,module,exports){
 'use strict';
 
 /**
@@ -10710,7 +13747,7 @@ exports.parse = function(millis) {
   return new Date(millis);
 };
 
-},{}],90:[function(require,module,exports){
+},{}],103:[function(require,module,exports){
 'use strict';
 
 /**
@@ -10742,7 +13779,7 @@ exports.parse = function(seconds) {
   return new Date(millis);
 };
 
-},{}],91:[function(require,module,exports){
+},{}],104:[function(require,module,exports){
 'use strict';
 
 /**
@@ -10820,7 +13857,7 @@ exports.is = function(string, strict) {
   return matcher.test(string);
 };
 
-},{}],92:[function(require,module,exports){
+},{}],105:[function(require,module,exports){
 (function (process,setImmediate){
 'use strict';
 
@@ -10888,7 +13925,7 @@ module.exports = (function () {
 }());
 
 }).call(this,require('_process'),require("timers").setImmediate)
-},{"_process":94,"timers":110}],93:[function(require,module,exports){
+},{"_process":108,"timers":125}],106:[function(require,module,exports){
 
 var identity = function(_){ return _; };
 
@@ -11042,7 +14079,92 @@ function isFunction(val) {
   return typeof val === 'function';
 }
 
-},{}],94:[function(require,module,exports){
+},{}],107:[function(require,module,exports){
+
+/**
+ * HOP ref.
+ */
+
+var has = Object.prototype.hasOwnProperty;
+
+/**
+ * Return own keys in `obj`.
+ *
+ * @param {Object} obj
+ * @return {Array}
+ * @api public
+ */
+
+exports.keys = Object.keys || function(obj){
+  var keys = [];
+  for (var key in obj) {
+    if (has.call(obj, key)) {
+      keys.push(key);
+    }
+  }
+  return keys;
+};
+
+/**
+ * Return own values in `obj`.
+ *
+ * @param {Object} obj
+ * @return {Array}
+ * @api public
+ */
+
+exports.values = function(obj){
+  var vals = [];
+  for (var key in obj) {
+    if (has.call(obj, key)) {
+      vals.push(obj[key]);
+    }
+  }
+  return vals;
+};
+
+/**
+ * Merge `b` into `a`.
+ *
+ * @param {Object} a
+ * @param {Object} b
+ * @return {Object} a
+ * @api public
+ */
+
+exports.merge = function(a, b){
+  for (var key in b) {
+    if (has.call(b, key)) {
+      a[key] = b[key];
+    }
+  }
+  return a;
+};
+
+/**
+ * Return length of `obj`.
+ *
+ * @param {Object} obj
+ * @return {Number}
+ * @api public
+ */
+
+exports.length = function(obj){
+  return exports.keys(obj).length;
+};
+
+/**
+ * Check if `obj` is empty.
+ *
+ * @param {Object} obj
+ * @return {Boolean}
+ * @api public
+ */
+
+exports.isEmpty = function(obj){
+  return 0 == exports.length(obj);
+};
+},{}],108:[function(require,module,exports){
 // shim for using process in browser
 var process = module.exports = {};
 
@@ -11228,7 +14350,110 @@ process.chdir = function (dir) {
 };
 process.umask = function() { return 0; };
 
-},{}],95:[function(require,module,exports){
+},{}],109:[function(require,module,exports){
+
+/**
+ * Module dependencies.
+ */
+
+var type = require('type-component');
+
+/**
+ * Expose `reject`
+ */
+
+module.exports = reject;
+
+/**
+ * Reject `obj`, `fn`.
+ *
+ * If `fn` is omitted a default function
+ * that removes nulls (undefined/null) will
+ * be supplied.
+ *
+ * @param {Object} obj
+ * @param {Function} fn
+ * @return {Object}
+ * @api public
+ */
+
+function reject(obj, fn){
+  fn = fn || compact;
+  return 'array' == type(obj)
+    ? reject.array(obj, fn)
+    : reject.object(obj, fn);
+}
+
+/**
+ * Reject `arr`, `fn`.
+ *
+ * @param {Array|String} arr
+ * @param {Function} fn
+ * @return {Object}
+ * @api public
+ */
+
+reject.array = function(arr, fn){
+  var ret = [];
+
+  for (var i = 0; i < arr.length; ++i) {
+    if (!fn(arr[i], i)) ret[ret.length] = arr[i];
+  }
+
+  return ret;
+};
+
+/**
+ * Reject `obj`, `fn`.
+ *
+ * @param {Object} obj
+ * @param {Function} fn
+ * @return {Object}
+ * @api public
+ */
+
+reject.object = function(obj, fn){
+  var ret = {};
+
+  for (var k in obj) {
+    if (obj.hasOwnProperty(k) && !fn(obj[k], k)) {
+      ret[k] = obj[k]
+    }
+  }
+
+  return ret;
+};
+
+/**
+ * Reject `type(s)` of `obj/arr`.
+ *
+ * @param {Object|Array} obj
+ * @param {Array|String} type(s)
+ * @return {Object|Array}
+ * @api public
+ */
+
+reject.types =
+reject.type = function(obj, types){
+  if (!Array.isArray(types)) types = [types];
+  return reject(obj, function(value){
+    return -1 != types.indexOf(type(value));
+  });
+};
+
+/**
+ * Reject `value` if it's `null` or `undefined`.
+ *
+ * @param {Mixed} value
+ * @return {Mixed}
+ * @api private
+ */
+
+function compact(value){
+  return null == value;
+}
+
+},{"type-component":129}],110:[function(require,module,exports){
 
 // https://github.com/thirdpartyjs/thirdpartyjs-code/blob/master/examples/templates/02/loading-files/index.html
 
@@ -11283,7 +14508,7 @@ function attach(el, fn){
   });
 }
 
-},{}],96:[function(require,module,exports){
+},{}],111:[function(require,module,exports){
 'use strict';
 
 var get = require('obj-case');
@@ -11319,7 +14544,7 @@ module.exports = function(proto) {
   }
 };
 
-},{"obj-case":93}],97:[function(require,module,exports){
+},{"obj-case":106}],112:[function(require,module,exports){
 'use strict';
 
 var inherit = require('./utils').inherit;
@@ -11400,7 +14625,7 @@ Alias.prototype.to = Alias.prototype.userId;
 
 module.exports = Alias;
 
-},{"./facade":99,"./utils":107}],98:[function(require,module,exports){
+},{"./facade":114,"./utils":122}],113:[function(require,module,exports){
 'use strict';
 
 var inherit = require('./utils').inherit;
@@ -11434,7 +14659,7 @@ Delete.prototype.type = function() {
 
 module.exports = Delete;
 
-},{"./facade":99,"./utils":107}],99:[function(require,module,exports){
+},{"./facade":114,"./utils":122}],114:[function(require,module,exports){
 'use strict';
 
 var address = require('./address');
@@ -11980,7 +15205,7 @@ function transform(obj) {
 
 module.exports = Facade;
 
-},{"./address":96,"./is-enabled":103,"./utils":107,"@segment/isodate-traverse":41,"new-date":88,"obj-case":93}],100:[function(require,module,exports){
+},{"./address":111,"./is-enabled":118,"./utils":122,"@segment/isodate-traverse":50,"new-date":101,"obj-case":106}],115:[function(require,module,exports){
 'use strict';
 
 var inherit = require('./utils').inherit;
@@ -12147,7 +15372,7 @@ Group.prototype.properties = function() {
 
 module.exports = Group;
 
-},{"./facade":99,"./utils":107,"is-email":80,"new-date":88}],101:[function(require,module,exports){
+},{"./facade":114,"./utils":122,"is-email":93,"new-date":101}],116:[function(require,module,exports){
 'use strict';
 
 var Facade = require('./facade');
@@ -12527,7 +15752,7 @@ Identify.prototype.birthday = Facade.proxy('traits.birthday');
 
 module.exports = Identify;
 
-},{"./facade":99,"./utils":107,"is-email":80,"new-date":88,"obj-case":93,"trim":113}],102:[function(require,module,exports){
+},{"./facade":114,"./utils":122,"is-email":93,"new-date":101,"obj-case":106,"trim":128}],117:[function(require,module,exports){
 'use strict';
 
 var Facade = require('./facade');
@@ -12542,7 +15767,7 @@ Facade.Delete = require('./delete');
 
 module.exports = Facade;
 
-},{"./alias":97,"./delete":98,"./facade":99,"./group":100,"./identify":101,"./page":104,"./screen":105,"./track":106}],103:[function(require,module,exports){
+},{"./alias":112,"./delete":113,"./facade":114,"./group":115,"./identify":116,"./page":119,"./screen":120,"./track":121}],118:[function(require,module,exports){
 'use strict';
 
 // A few integrations are disabled by default. They must be explicitly enabled
@@ -12562,7 +15787,7 @@ module.exports = function(integration) {
   return !disabled[integration];
 };
 
-},{}],104:[function(require,module,exports){
+},{}],119:[function(require,module,exports){
 'use strict';
 
 var inherit = require('./utils').inherit;
@@ -12778,7 +16003,7 @@ Page.prototype.track = function(name) {
 
 module.exports = Page;
 
-},{"./facade":99,"./track":106,"./utils":107,"is-email":80}],105:[function(require,module,exports){
+},{"./facade":114,"./track":121,"./utils":122,"is-email":93}],120:[function(require,module,exports){
 'use strict';
 
 var inherit = require('./utils').inherit;
@@ -12850,7 +16075,7 @@ Screen.prototype.track = function(name) {
 
 module.exports = Screen;
 
-},{"./page":104,"./track":106,"./utils":107}],106:[function(require,module,exports){
+},{"./page":119,"./track":121,"./utils":122}],121:[function(require,module,exports){
 'use strict';
 
 var inherit = require('./utils').inherit;
@@ -13439,14 +16664,14 @@ function currency(val) {
 
 module.exports = Track;
 
-},{"./facade":99,"./identify":101,"./utils":107,"is-email":80,"obj-case":93}],107:[function(require,module,exports){
+},{"./facade":114,"./identify":116,"./utils":122,"is-email":93,"obj-case":106}],122:[function(require,module,exports){
 'use strict';
 
 exports.inherit = require('inherits');
 exports.clone = require('@ndhoule/clone');
 exports.type = require('type-component');
 
-},{"@ndhoule/clone":5,"inherits":79,"type-component":114}],108:[function(require,module,exports){
+},{"@ndhoule/clone":5,"inherits":92,"type-component":129}],123:[function(require,module,exports){
 
 /**
  * Generate a slug from the given `str`.
@@ -13471,7 +16696,7 @@ module.exports = function (str, options) {
     .replace(/ +/g, options.separator || '-')
 };
 
-},{}],109:[function(require,module,exports){
+},{}],124:[function(require,module,exports){
 (function (factory) {
     if (typeof exports === 'object') {
         // Node/CommonJS
@@ -14176,7 +17401,7 @@ module.exports = function (str, options) {
     return SparkMD5;
 }));
 
-},{}],110:[function(require,module,exports){
+},{}],125:[function(require,module,exports){
 (function (setImmediate,clearImmediate){
 var nextTick = require('process/browser.js').nextTick;
 var apply = Function.prototype.apply;
@@ -14255,7 +17480,7 @@ exports.clearImmediate = typeof clearImmediate === "function" ? clearImmediate :
   delete immediateIds[id];
 };
 }).call(this,require("timers").setImmediate,require("timers").clearImmediate)
-},{"process/browser.js":94,"timers":110}],111:[function(require,module,exports){
+},{"process/browser.js":108,"timers":125}],126:[function(require,module,exports){
 
 /**
  * Module Dependencies
@@ -14409,7 +17634,7 @@ function stripNested (prop, str, val) {
   });
 }
 
-},{"component-props":70,"props":70}],112:[function(require,module,exports){
+},{"component-props":80,"props":80}],127:[function(require,module,exports){
 
 /**
  * Expose `toNoCase`.
@@ -14481,7 +17706,7 @@ function uncamelize (string) {
     return previous + ' ' + uppers.toLowerCase().split('').join(' ');
   });
 }
-},{}],113:[function(require,module,exports){
+},{}],128:[function(require,module,exports){
 
 exports = module.exports = trim;
 
@@ -14497,7 +17722,7 @@ exports.right = function(str){
   return str.replace(/\s*$/, '');
 };
 
-},{}],114:[function(require,module,exports){
+},{}],129:[function(require,module,exports){
 
 /**
  * toString ref.
@@ -14529,7 +17754,45 @@ module.exports = function(val){
   return typeof val;
 };
 
-},{}],115:[function(require,module,exports){
+},{}],130:[function(require,module,exports){
+
+/**
+ * Protocol.
+ */
+
+module.exports = function (url) {
+  switch (arguments.length) {
+    case 0: return check();
+    case 1: return transform(url);
+  }
+};
+
+
+/**
+ * Transform a protocol-relative `url` to the use the proper protocol.
+ *
+ * @param {String} url
+ * @return {String}
+ */
+
+function transform (url) {
+  return check() ? 'https:' + url : 'http:' + url;
+}
+
+
+/**
+ * Check whether `https:` be used for loading scripts.
+ *
+ * @return {Boolean}
+ */
+
+function check () {
+  return (
+    location.protocol == 'https:' ||
+    location.protocol == 'chrome-extension:'
+  );
+}
+},{}],131:[function(require,module,exports){
 module.exports = encode;
 
 function encode(string) {
@@ -14557,7 +17820,7 @@ function encode(string) {
 
     return utftext;
 }
-},{}],116:[function(require,module,exports){
+},{}],132:[function(require,module,exports){
 (function (global){
 
 var rng;
@@ -14593,7 +17856,7 @@ module.exports = rng;
 
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],117:[function(require,module,exports){
+},{}],133:[function(require,module,exports){
 //     uuid.js
 //
 //     Copyright (c) 2010-2012 Robert Kieffer
@@ -14778,7 +18041,7 @@ uuid.unparse = unparse;
 
 module.exports = uuid;
 
-},{"./rng":116}],118:[function(require,module,exports){
+},{"./rng":132}],134:[function(require,module,exports){
 
 /**
  * dependencies.
@@ -14873,7 +18136,7 @@ function all(){
   return ret;
 }
 
-},{"each":66,"unserialize":119}],119:[function(require,module,exports){
+},{"each":76,"unserialize":135}],135:[function(require,module,exports){
 
 /**
  * Unserialize the given "stringified" javascript.
@@ -14890,7 +18153,7 @@ module.exports = function(val){
   }
 };
 
-},{}],120:[function(require,module,exports){
+},{}],136:[function(require,module,exports){
 module.exports={
   "name": "@segment/analytics.js",
   "author": "Segment <friends@segment.com>",
@@ -14917,10 +18180,13 @@ module.exports={
     "url": "https://github.com/segmentio/analytics.js/issues"
   },
   "homepage": "https://github.com/segmentio/analytics.js#readme",
+  "//": "Update analytics.js-core to latest once https://github.com/segmentio/analytics.js-core/issues/129 is resolved",
   "dependencies": {
-    "@segment/analytics.js-core": "^3.0.0",
-    "@segment/analytics.js-integration": "^3.1.0",
-    "@segment/analytics.js-integration-segmentio": "git+https://github.com/segment-integrations/analytics.js-integration-segmentio.git"
+    "@segment/analytics.js-core": "3.10.1",
+    "@segment/analytics.js-integration": "3.3.1",
+    "@segment/analytics.js-integration-google-tag-manager": "git+https://github.com/segment-integrations/analytics.js-integration-google-tag-manager.git",
+    "@segment/analytics.js-integration-google-analytics": "2.18.2",
+    "@segment/analytics.js-integration-segmentio": "4.2.2"
   },
   "devDependencies": {
     "@segment/eslint-config": "^3.1.1",

@@ -24,10 +24,13 @@
     "url": "https://github.com/segmentio/analytics.js/issues"
   },
   "homepage": "https://github.com/segmentio/analytics.js#readme",
+  "//": "Update analytics.js-core to latest once https://github.com/segmentio/analytics.js-core/issues/129 is resolved",
   "dependencies": {
-    "@segment/analytics.js-core": "^3.0.0",
-    "@segment/analytics.js-integration": "^3.1.0",
-    "@segment/analytics.js-integration-segmentio": "git+https://github.com/segment-integrations/analytics.js-integration-segmentio.git"
+    "@segment/analytics.js-core": "3.10.1",
+    "@segment/analytics.js-integration": "3.3.1",
+    "@segment/analytics.js-integration-google-tag-manager": "git+https://github.com/segment-integrations/analytics.js-integration-google-tag-manager.git",
+    "@segment/analytics.js-integration-google-analytics": "2.18.2",
+    "@segment/analytics.js-integration-segmentio": "4.2.2"
   },
   "devDependencies": {
     "@segment/eslint-config": "^3.1.1",
